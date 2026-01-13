@@ -1,0 +1,11 @@
+{
+  "allowed_tools": [
+    "bash",
+    "edit",
+    "read",
+    "write",
+    "glob",
+    "grep"
+  ],
+  "blocked_tools": []
+}
