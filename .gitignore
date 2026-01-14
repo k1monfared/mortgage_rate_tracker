@@ -6,3 +6,15 @@ node_modules/
 .claude/cache/
 .mcp/logs/
 *.claude-session
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Project specific
+data/
+output/
+*.png
