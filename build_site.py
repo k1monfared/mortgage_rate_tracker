@@ -46,31 +46,45 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     .stat-box {
       background: #fff; border: 1px solid #e0e0e0; border-radius: 10px;
-      padding: 14px 28px; text-align: center; min-width: 180px;
+      padding: 14px 28px; text-align: center; min-width: 160px; flex: 1 1 160px; max-width: 260px;
       box-shadow: 0 1px 4px rgba(0,0,0,.06);
     }
     .stat-box .label { font-size: 12px; color: #777; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
     .stat-box .value { font-size: 30px; font-weight: 700; color: #1a1a2e; }
     .stat-box .as-of { font-size: 11px; color: #aaa; margin-top: 3px; }
-    .controls { text-align: center; margin-bottom: 12px; }
+    .controls {
+      display: flex; gap: 8px; justify-content: center; align-items: center;
+      flex-wrap: wrap; margin-bottom: 12px;
+    }
     .btn {
-      padding: 7px 18px; border: 1px solid #ccc; border-radius: 6px;
-      background: #fff; cursor: pointer; font-size: 13px; color: #444;
+      padding: 9px 18px; border: 1px solid #ccc; border-radius: 6px;
+      background: #fff; cursor: pointer; font-size: 14px; color: #444;
+      min-height: 42px; touch-action: manipulation;
       transition: background .15s, border-color .15s;
     }
     .btn:hover { background: #f0f0f0; border-color: #aaa; }
     .btn.active { background: #1a1a2e; color: #fff; border-color: #1a1a2e; }
     .btn:disabled { opacity: .55; cursor: default; }
-    #refreshStatus { font-size: 12px; color: #777; margin-left: 8px; }
+    #refreshStatus { font-size: 12px; color: #777; }
     .chart-wrap {
       background: #fff; border: 1px solid #e0e0e0; border-radius: 10px;
       padding: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.06);
     }
-    #chart { width: 100%; height: 580px; }
+    #chart { width: 100%; height: 560px; }
     .footer {
       text-align: center; font-size: 11px; color: #bbb; margin-top: 14px;
     }
     #error { color: #c00; text-align: center; padding: 20px; display: none; }
+
+    @media (max-width: 640px) {
+      body { padding: 12px 10px; }
+      h1 { font-size: 1.25rem; margin-bottom: 14px; }
+      .stats { gap: 10px; }
+      .stat-box { padding: 10px 14px; min-width: 130px; }
+      .stat-box .value { font-size: 24px; }
+      .btn { font-size: 13px; padding: 9px 14px; }
+      #chart { height: 360px; }
+    }
   </style>
 </head>
 <body>
@@ -336,7 +350,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         data: ['BoC Policy Rate', 'Commercial Prime Rate'],
         top: 8, itemGap: 24,
       },
-      grid: { left: 54, right: 24, top: 48, bottom: 70, containLabel: false },
+      grid: { left: 8, right: 8, top: 48, bottom: 65, containLabel: true },
       xAxis: {
         type: 'time',
         boundaryGap: false,
