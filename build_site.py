@@ -30,7 +30,7 @@ def build_site():
 
     fig = plotter.plot_dual_rates(policy_df, prime_df)
 
-    chart_html = pio.to_html(fig, include_plotlyjs="cdn", full_html=False)
+    chart_html = pio.to_html(fig, include_plotlyjs=False, full_html=False)
 
     latest_policy = policy_df.sort_values("date").iloc[-1]
     latest_prime = prime_df.sort_values("date").iloc[-1]
@@ -48,6 +48,7 @@ def build_site():
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Canadian Interest Rate Tracker</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
   <style>
     body {{
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
