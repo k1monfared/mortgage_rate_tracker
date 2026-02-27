@@ -75,6 +75,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       text-align: center; font-size: 11px; color: #bbb; margin-top: 14px;
     }
     #error { color: #c00; text-align: center; padding: 20px; display: none; }
+    .description {
+      max-width: 780px; margin: 14px auto 0; padding: 0 4px;
+      font-size: 13px; line-height: 1.6; color: #666; text-align: left;
+    }
+    .description strong { color: #444; }
 
     @media (max-width: 640px) {
       body { padding: 12px 10px; }
@@ -115,6 +120,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <p id="error">Failed to load chart data. Please try refreshing.</p>
 
+  <div class="description">
+    <p>The <strong>BoC Policy Rate</strong> is the overnight interest rate target set by the
+    Bank of Canada at up to eight scheduled announcements per year; it directly steers
+    borrowing costs across the economy. The <strong>Commercial Prime Rate</strong> is the
+    benchmark lending rate used by major Canadian banks, historically running about
+    2–2.5 percentage points above the Policy Rate. Hover over the chart to read exact
+    values for any date. Zoom in to under three years to see individual announcement
+    dots on the line.</p>
+  </div>
+
   <div class="footer">
     Data source: <a href="https://www.bankofcanada.ca/valet/docs" target="_blank">Bank of Canada Valet API</a>
     &mdash; Built __BUILD_TIME__
@@ -122,7 +137,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <script>
   // ── Module-level state ─────────────────────────────────────────────────
-  var rates, events, chart, eventsVisible = false;
+  var rates, events, chart, eventsVisible = false, dotsVisible = false;
+  var THREE_YEARS_MS = 3 * 365.25 * 24 * 3600 * 1000;
 
   // ── BoC series codes ───────────────────────────────────────────────────
   var BOC_POLICY = 'V122530';
@@ -430,6 +446,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     // Refresh button
     document.getElementById('refreshBtn').addEventListener('click', refreshData);
+
+    // Show dots only when zoomed inside a 3-year window
+    function updateDots() {
+      var opt = chart.getOption();
+      var dz  = opt.dataZoom && opt.dataZoom[0];
+      if (!dz) return;
+      var rangeMs   = (dz.endValue || 0) - (dz.startValue || 0);
+      var shouldShow = rangeMs > 0 && rangeMs < THREE_YEARS_MS;
+      if (shouldShow === dotsVisible) return;
+      dotsVisible = shouldShow;
+      chart.setOption({
+        series: [
+          { symbol: dotsVisible ? 'circle' : 'none', symbolSize: 5 },
+          { symbol: dotsVisible ? 'circle' : 'none', symbolSize: 5 },
+        ],
+      });
+    }
+    chart.on('datazoom', updateDots);
 
     // Responsive
     window.addEventListener('resize', function() { chart.resize(); });
