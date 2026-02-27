@@ -110,6 +110,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <div class="controls">
     <button class="btn" id="toggleEvents">Show Historical Events</button>
+    <button class="btn" id="resetZoom">Reset Zoom</button>
     <button class="btn" id="refreshBtn">Refresh Data</button>
     <span id="refreshStatus"></span>
   </div>
@@ -395,6 +396,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           zoomOnMouseWheel: true,
           moveOnMouseWheel: false,
           moveOnMouseMove: true,
+          moveOnTouchMove: true,
         },
         {
           type: 'slider',
@@ -446,6 +448,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     // Refresh button
     document.getElementById('refreshBtn').addEventListener('click', refreshData);
+
+    // Reset Zoom button
+    document.getElementById('resetZoom').addEventListener('click', function() {
+      var start = new Date();
+      start.setFullYear(start.getFullYear() - 15);
+      var startMs = start.getTime();
+      var endMs   = Date.now();
+      chart.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0, startValue: startMs, endValue: endMs });
+      chart.dispatchAction({ type: 'dataZoom', dataZoomIndex: 1, startValue: startMs, endValue: endMs });
+    });
 
     // Show dots only when zoomed inside a 3-year window
     function updateDots() {
