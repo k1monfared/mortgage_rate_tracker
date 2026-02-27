@@ -152,17 +152,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   var emptyMarkArea = { data: [] };
 
+  // Binary search: last entry in sorted series whose date <= ts (ms).
+  // Returns the rate value, or null if ts is before all data.
+  function findStepRate(series, ts) {
+    var lo = 0, hi = series.length - 1, result = null;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      var midTs = new Date(series[mid].date + 'T12:00:00Z').getTime();
+      if (midTs <= ts) { result = series[mid].rate; lo = mid + 1; }
+      else              { hi = mid - 1; }
+    }
+    return result;
+  }
+
   function tooltipFormatter(params) {
     if (!params || !params.length) return '';
-    var date = new Date(params[0].axisValue).toISOString().slice(0, 10);
-    var html = '<strong>' + date + '</strong><br>';
-    params.forEach(function(p) {
-      if (p.value && p.value[1] != null) {
-        html += '<span style="color:' + p.color + '">&#9679;</span> '
-              + p.seriesName + ': <strong>'
-              + Number(p.value[1]).toFixed(2) + '%</strong><br>';
-      }
-    });
+    var ts   = params[0].axisValue;
+    var date = new Date(ts).toISOString().slice(0, 10);
+    var pRate = findStepRate(rates.policy, ts);
+    var qRate = findStepRate(rates.prime,  ts);
+    var html  = '<strong>' + date + '</strong><br>';
+    if (pRate !== null)
+      html += '<span style="color:#2E86AB">&#9679;</span> BoC Policy Rate: <strong>'
+            + pRate.toFixed(2) + '%</strong><br>';
+    if (qRate !== null)
+      html += '<span style="color:#A23B72">&#9679;</span> Commercial Prime Rate: <strong>'
+            + qRate.toFixed(2) + '%</strong><br>';
     return html;
   }
 
@@ -325,7 +340,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       xAxis: {
         type: 'time',
         boundaryGap: false,
-        axisLine: { lineStyle: { color: '#ccc' } },
+        axisLine:  { lineStyle: { color: '#999' } },
+        axisTick:  { lineStyle: { color: '#999' } },
+        axisLabel: { fontSize: 13, color: '#333' },
         splitLine: { show: false },
       },
       yAxis: {
@@ -334,9 +351,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         max: function(value) {
           return value.max > 0 ? Math.ceil(value.max * 1.12) : 25;
         },
-        axisLabel: { formatter: '{value}%' },
-        splitLine: { lineStyle: { color: '#f0f0f0' } },
-        axisLine: { show: true, lineStyle: { color: '#ccc' } },
+        axisLabel: { formatter: '{value}%', fontSize: 13, color: '#333' },
+        axisTick:  { lineStyle: { color: '#999' } },
+        splitLine: { lineStyle: { color: '#e8e8e8' } },
+        axisLine:  { show: true, lineStyle: { color: '#999' } },
       },
       dataZoom: [
         {
