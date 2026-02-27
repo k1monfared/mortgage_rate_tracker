@@ -1,0 +1,46 @@
+{
+  "regions": [
+    {
+      "id": "high_inflation",
+      "label": "High Inflation Era",
+      "start": "1973-01-01",
+      "end": "1983-12-31",
+      "color": "rgba(255, 160, 100, 0.18)"
+    },
+    {
+      "id": "recession_1990",
+      "label": "1990–91 Recession",
+      "start": "1990-03-01",
+      "end": "1991-06-01",
+      "color": "rgba(180, 140, 220, 0.20)"
+    },
+    {
+      "id": "dotcom_bust",
+      "label": "Dot-com Bust",
+      "start": "2000-09-01",
+      "end": "2002-03-01",
+      "color": "rgba(140, 180, 255, 0.20)"
+    },
+    {
+      "id": "financial_crisis_2008",
+      "label": "2008 Financial Crisis",
+      "start": "2008-09-01",
+      "end": "2009-06-01",
+      "color": "rgba(255, 130, 130, 0.22)"
+    },
+    {
+      "id": "covid_pandemic",
+      "label": "COVID-19 Pandemic",
+      "start": "2020-03-01",
+      "end": "2021-09-01",
+      "color": "rgba(255, 200, 80, 0.22)"
+    },
+    {
+      "id": "rapid_hikes",
+      "label": "Post-pandemic Rate Hikes",
+      "start": "2022-03-02",
+      "end": "2023-07-12",
+      "color": "rgba(100, 200, 160, 0.22)"
+    }
+  ]
+}
