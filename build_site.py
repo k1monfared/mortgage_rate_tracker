@@ -273,10 +273,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     updateStatBoxes();
 
-    var markPointStyle = {
-      symbolSize: 44,
-      label: { show: true, fontSize: 10, formatter: mpFormatter },
-    };
+    // Default x-axis window: past 15 years
+    var defaultStart = (function() {
+      var d = new Date();
+      d.setFullYear(d.getFullYear() - 15);
+      return d.toISOString().slice(0, 10);
+    })();
+
+    // markPoint config: no symbol, text label above (max) / below (min), white bg to avoid overlap
+    function makeMarkPoint(color) {
+      var labelBase = {
+        show: true,
+        fontSize: 11,
+        fontWeight: 'bold',
+        color: color,
+        formatter: mpFormatter,
+        backgroundColor: 'rgba(255,255,255,0.82)',
+        padding: [2, 5],
+        borderRadius: 3,
+      };
+      return {
+        data: [
+          {
+            type: 'max', name: 'Max',
+            symbol: 'circle', symbolSize: 5, itemStyle: { color: color },
+            label: Object.assign({}, labelBase, { position: 'top', offset: [0, -6] }),
+          },
+          {
+            type: 'min', name: 'Min',
+            symbol: 'circle', symbolSize: 5, itemStyle: { color: color },
+            label: Object.assign({}, labelBase, { position: 'bottom', offset: [0, 6] }),
+          },
+        ],
+      };
+    }
 
     chart = echarts.init(document.getElementById('chart'));
 
@@ -313,6 +343,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           type: 'inside',
           xAxisIndex: [0],
           filterMode: 'filter',
+          startValue: defaultStart,
           zoomOnMouseWheel: true,
           moveOnMouseWheel: false,
           moveOnMouseMove: true,
@@ -321,6 +352,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           type: 'slider',
           xAxisIndex: [0],
           filterMode: 'filter',
+          startValue: defaultStart,
           bottom: 8, height: 22,
           borderColor: '#ddd',
           fillerColor: 'rgba(26,26,46,0.08)',
@@ -335,12 +367,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           lineStyle: { color: '#2E86AB', width: 2 },
           itemStyle: { color: '#2E86AB' },
           symbol: 'none',
-          markPoint: Object.assign({
-            data: [
-              { type: 'max', name: 'Max', itemStyle: { color: '#2E86AB' } },
-              { type: 'min', name: 'Min', itemStyle: { color: '#2E86AB' } },
-            ],
-          }, markPointStyle),
+          markPoint: makeMarkPoint('#2E86AB'),
           markArea: emptyMarkArea,
         },
         {
@@ -350,12 +377,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           lineStyle: { color: '#A23B72', width: 2 },
           itemStyle: { color: '#A23B72' },
           symbol: 'none',
-          markPoint: Object.assign({
-            data: [
-              { type: 'max', name: 'Max', itemStyle: { color: '#A23B72' } },
-              { type: 'min', name: 'Min', itemStyle: { color: '#A23B72' } },
-            ],
-          }, markPointStyle),
+          markPoint: makeMarkPoint('#A23B72'),
           markArea: emptyMarkArea,
         },
       ],
