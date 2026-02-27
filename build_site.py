@@ -60,6 +60,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     .btn:hover { background: #f0f0f0; border-color: #aaa; }
     .btn.active { background: #1a1a2e; color: #fff; border-color: #1a1a2e; }
+    .btn:disabled { opacity: .55; cursor: default; }
+    #refreshStatus { font-size: 12px; color: #777; margin-left: 8px; }
     .chart-wrap {
       background: #fff; border: 1px solid #e0e0e0; border-radius: 10px;
       padding: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.06);
@@ -89,6 +91,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <div class="controls">
     <button class="btn" id="toggleEvents">Show Historical Events</button>
+    <button class="btn" id="refreshBtn">Refresh Data</button>
+    <span id="refreshStatus"></span>
   </div>
 
   <div class="chart-wrap">
@@ -103,89 +107,180 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <script>
-  (async () => {
-    // ── Load data ──────────────────────────────────────────────────────────
-    let rates, events;
+  // ── Module-level state ─────────────────────────────────────────────────
+  var rates, events, chart, eventsVisible = false;
+
+  // ── BoC series codes ───────────────────────────────────────────────────
+  var BOC_POLICY = 'V122530';
+  var BOC_PRIME  = 'V80691311';
+
+  // ── Helpers ────────────────────────────────────────────────────────────
+  function nextDay(dateStr) {
+    var d = new Date(dateStr + 'T12:00:00Z');
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString().slice(0, 10);
+  }
+
+  function today() {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  function mpFormatter(p) {
+    var val  = Array.isArray(p.value) ? p.value[1] : p.value;
+    var date = '';
+    if (p.data && p.data.coord && p.data.coord[0]) {
+      date = '\n' + new Date(p.data.coord[0]).toISOString().slice(0, 10);
+    }
+    return p.name + ': ' + Number(val).toFixed(2) + '%' + date;
+  }
+
+  function buildMarkArea() {
+    return {
+      silent: true,
+      label: {
+        show: true, position: 'insideTop', distance: 6,
+        fontSize: 10, color: '#555', rotate: 90, overflow: 'truncate',
+      },
+      data: events.regions.map(function(r) {
+        return [
+          { name: r.label, xAxis: r.start, itemStyle: { color: r.color } },
+          { xAxis: r.end },
+        ];
+      }),
+    };
+  }
+
+  var emptyMarkArea = { data: [] };
+
+  function tooltipFormatter(params) {
+    if (!params || !params.length) return '';
+    var date = new Date(params[0].axisValue).toISOString().slice(0, 10);
+    var html = '<strong>' + date + '</strong><br>';
+    params.forEach(function(p) {
+      if (p.value && p.value[1] != null) {
+        html += '<span style="color:' + p.color + '">&#9679;</span> '
+              + p.seriesName + ': <strong>'
+              + Number(p.value[1]).toFixed(2) + '%</strong><br>';
+      }
+    });
+    return html;
+  }
+
+  // ── Chart update helpers ───────────────────────────────────────────────
+  function updateStatBoxes() {
+    var meta = rates.meta;
+    document.getElementById('policyRate').textContent = meta.policy_current.toFixed(2) + '%';
+    document.getElementById('policyDate').textContent = 'as of ' + meta.policy_current_date;
+    document.getElementById('primeRate').textContent  = meta.prime_current.toFixed(2) + '%';
+    document.getElementById('primeDate').textContent  = 'as of ' + meta.prime_current_date;
+  }
+
+  function updateChartSeries() {
+    chart.setOption({
+      series: [
+        { data: rates.policy.map(function(d) { return [d.date, d.rate]; }) },
+        { data: rates.prime.map(function(d)  { return [d.date, d.rate]; }) },
+      ],
+    });
+  }
+
+  // ── Fetch new records from BoC JSON API ────────────────────────────────
+  function fetchBoCJson(series, startDate, endDate) {
+    var url = 'https://www.bankofcanada.ca/valet/observations/'
+              + series + '/json?start_date=' + startDate + '&end_date=' + endDate;
+    return fetch(url)
+      .then(function(r) {
+        if (!r.ok) throw new Error('BoC API returned ' + r.status);
+        return r.json();
+      })
+      .then(function(data) {
+        var obs = data.observations || [];
+        return obs
+          .filter(function(o) { return o[series] && o[series].v != null; })
+          .map(function(o) { return { date: o.d, rate: parseFloat(o[series].v) }; })
+          .filter(function(d) { return !isNaN(d.rate); });
+      });
+  }
+
+  // ── Refresh button handler ─────────────────────────────────────────────
+  function refreshData() {
+    var btn    = document.getElementById('refreshBtn');
+    var status = document.getElementById('refreshStatus');
+    btn.disabled = true;
+    btn.textContent = 'Refreshing…';
+    status.textContent = '';
+
+    var policyStart = nextDay(rates.policy[rates.policy.length - 1].date);
+    var primeStart  = nextDay(rates.prime[rates.prime.length - 1].date);
+    var end = today();
+
+    Promise.all([
+      fetchBoCJson(BOC_POLICY, policyStart, end),
+      fetchBoCJson(BOC_PRIME,  primeStart,  end),
+    ])
+    .then(function(results) {
+      var newPolicy = results[0];
+      var newPrime  = results[1];
+      var total = newPolicy.length + newPrime.length;
+
+      if (total === 0) {
+        status.textContent = 'Already up to date.';
+      } else {
+        rates.policy = rates.policy.concat(newPolicy);
+        rates.prime  = rates.prime.concat(newPrime);
+
+        if (newPolicy.length > 0) {
+          var lp = newPolicy[newPolicy.length - 1];
+          rates.meta.policy_current      = lp.rate;
+          rates.meta.policy_current_date = lp.date;
+        }
+        if (newPrime.length > 0) {
+          var lpr = newPrime[newPrime.length - 1];
+          rates.meta.prime_current      = lpr.rate;
+          rates.meta.prime_current_date = lpr.date;
+        }
+
+        updateStatBoxes();
+        updateChartSeries();
+        status.textContent = '✓ Added ' + total + ' new record' + (total > 1 ? 's' : '') + '.';
+      }
+
+      btn.textContent = 'Refresh Data';
+      btn.disabled = false;
+    })
+    .catch(function(e) {
+      console.error('Refresh failed:', e);
+      status.textContent = 'Error fetching data — check console.';
+      btn.textContent = 'Refresh Data';
+      btn.disabled = false;
+    });
+  }
+
+  // ── Init ───────────────────────────────────────────────────────────────
+  (async function init() {
     try {
-      [rates, events] = await Promise.all([
-        fetch('data/rates.json').then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }),
-        fetch('data/events.json').then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }),
+      var results = await Promise.all([
+        fetch('data/rates.json').then(function(r)  { if (!r.ok) throw new Error(r.status); return r.json(); }),
+        fetch('data/events.json').then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); }),
       ]);
+      rates  = results[0];
+      events = results[1];
     } catch (e) {
       document.getElementById('error').style.display = 'block';
       console.error('Data load failed:', e);
       return;
     }
 
-    // ── Stat boxes ─────────────────────────────────────────────────────────
-    const meta = rates.meta;
-    document.getElementById('policyRate').textContent = meta.policy_current.toFixed(2) + '%';
-    document.getElementById('policyDate').textContent = 'as of ' + meta.policy_current_date;
-    document.getElementById('primeRate').textContent  = meta.prime_current.toFixed(2) + '%';
-    document.getElementById('primeDate').textContent  = 'as of ' + meta.prime_current_date;
+    updateStatBoxes();
 
-    // ── Prepare series data ────────────────────────────────────────────────
-    const policyData = rates.policy.map(d => [d.date, d.rate]);
-    const primeData  = rates.prime.map(d => [d.date, d.rate]);
-
-    // ── markPoint label formatter ──────────────────────────────────────────
-    function mpFormatter(p) {
-      var val  = Array.isArray(p.value) ? p.value[1] : p.value;
-      var date = '';
-      if (p.data && p.data.coord && p.data.coord[0]) {
-        date = '\n' + new Date(p.data.coord[0]).toISOString().slice(0, 10);
-      }
-      return p.name + ': ' + Number(val).toFixed(2) + '%' + date;
-    }
-
-    // ── markArea builder from events ───────────────────────────────────────
-    function buildMarkArea() {
-      return {
-        silent: true,
-        label: {
-          show: true,
-          position: 'insideTop',
-          distance: 6,
-          fontSize: 10,
-          color: '#555',
-          rotate: 90,
-          overflow: 'truncate',
-        },
-        data: events.regions.map(function(r) {
-          return [
-            { name: r.label, xAxis: r.start, itemStyle: { color: r.color } },
-            { xAxis: r.end },
-          ];
-        }),
-      };
-    }
-
-    const emptyMarkArea = { data: [] };
-
-    // ── Tooltip formatter ──────────────────────────────────────────────────
-    function tooltipFormatter(params) {
-      if (!params || !params.length) return '';
-      var date = new Date(params[0].axisValue).toISOString().slice(0, 10);
-      var html = '<strong>' + date + '</strong><br>';
-      params.forEach(function(p) {
-        if (p.value && p.value[1] != null) {
-          html += '<span style="color:' + p.color + '">&#9679;</span> '
-                + p.seriesName + ': <strong>'
-                + Number(p.value[1]).toFixed(2) + '%</strong><br>';
-        }
-      });
-      return html;
-    }
-
-    // ── ECharts init ───────────────────────────────────────────────────────
-    const chart = echarts.init(document.getElementById('chart'));
-
-    const markPointStyle = {
+    var markPointStyle = {
       symbolSize: 44,
       label: { show: true, fontSize: 10, formatter: mpFormatter },
     };
 
-    const option = {
+    chart = echarts.init(document.getElementById('chart'));
+
+    chart.setOption({
       backgroundColor: '#fff',
       tooltip: {
         trigger: 'axis',
@@ -194,8 +289,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       },
       legend: {
         data: ['BoC Policy Rate', 'Commercial Prime Rate'],
-        top: 8,
-        itemGap: 24,
+        top: 8, itemGap: 24,
       },
       grid: { left: 54, right: 24, top: 48, bottom: 70, containLabel: false },
       xAxis: {
@@ -207,6 +301,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       yAxis: {
         type: 'value',
         min: 0,
+        max: function(value) {
+          return value.max > 0 ? Math.ceil(value.max * 1.12) : 25;
+        },
         axisLabel: { formatter: '{value}%' },
         splitLine: { lineStyle: { color: '#f0f0f0' } },
         axisLine: { show: true, lineStyle: { color: '#ccc' } },
@@ -215,7 +312,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         {
           type: 'inside',
           xAxisIndex: [0],
-          yAxisIndex: [0],
+          filterMode: 'filter',
           zoomOnMouseWheel: true,
           moveOnMouseWheel: false,
           moveOnMouseMove: true,
@@ -223,8 +320,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         {
           type: 'slider',
           xAxisIndex: [0],
-          bottom: 8,
-          height: 22,
+          filterMode: 'filter',
+          bottom: 8, height: 22,
           borderColor: '#ddd',
           fillerColor: 'rgba(26,26,46,0.08)',
           handleStyle: { color: '#1a1a2e' },
@@ -233,9 +330,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       series: [
         {
           name: 'BoC Policy Rate',
-          type: 'line',
-          step: 'end',
-          data: policyData,
+          type: 'line', step: 'end',
+          data: rates.policy.map(function(d) { return [d.date, d.rate]; }),
           lineStyle: { color: '#2E86AB', width: 2 },
           itemStyle: { color: '#2E86AB' },
           symbol: 'none',
@@ -249,9 +345,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         },
         {
           name: 'Commercial Prime Rate',
-          type: 'line',
-          step: 'end',
-          data: primeData,
+          type: 'line', step: 'end',
+          data: rates.prime.map(function(d) { return [d.date, d.rate]; }),
           lineStyle: { color: '#A23B72', width: 2 },
           itemStyle: { color: '#A23B72' },
           symbol: 'none',
@@ -264,21 +359,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           markArea: emptyMarkArea,
         },
       ],
-    };
+    });
 
-    chart.setOption(option);
-
-    // ── Events toggle ──────────────────────────────────────────────────────
-    var eventsVisible = false;
+    // Events toggle
     document.getElementById('toggleEvents').addEventListener('click', function() {
       eventsVisible = !eventsVisible;
-      var ma = eventsVisible ? buildMarkArea() : emptyMarkArea;
-      chart.setOption({ series: [{ markArea: ma }, { markArea: emptyMarkArea }] });
+      chart.setOption({
+        series: [
+          { markArea: eventsVisible ? buildMarkArea() : emptyMarkArea },
+          { markArea: emptyMarkArea },
+        ],
+      });
       this.textContent = eventsVisible ? 'Hide Historical Events' : 'Show Historical Events';
       this.classList.toggle('active', eventsVisible);
     });
 
-    // ── Responsive ────────────────────────────────────────────────────────
+    // Refresh button
+    document.getElementById('refreshBtn').addEventListener('click', refreshData);
+
+    // Responsive
     window.addEventListener('resize', function() { chart.resize(); });
   })();
   </script>
