@@ -163,7 +163,8 @@ def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[
 <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
 <p style="font-size:12px;color:#666;">
   You are receiving this because you subscribed to {cfg['short_label']} updates.
-  <a href="{{{{UNSUB_URL}}}}" style="color:#666;">Unsubscribe</a>
+  <a href="{{{{UNSUB_URL}}}}" style="color:#666;">Unsubscribe from this list</a>
+  &middot; <a href="{{{{PREFS_URL}}}}" style="color:#666;">Manage preferences</a>
   &middot; <a href="https://k1monfared.github.io/sponsor.html" style="color:#666;">Support</a>
 </p>
 </body></html>"""
@@ -182,7 +183,8 @@ def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[
         text_lines.append(f"Before that, {older['value']:.2f}% on {older['date']}.")
     text_lines.append("")
     text_lines.append(f"View the full chart: {page_url}")
-    text_lines.append("Unsubscribe: {{UNSUB_URL}}")
+    text_lines.append("Unsubscribe from this list: {{UNSUB_URL}}")
+    text_lines.append("Manage preferences (both regions): {{PREFS_URL}}")
     text_lines.append("Support: https://k1monfared.github.io/sponsor.html")
 
     return {"subject": subject, "html": html, "text": "\n".join(text_lines)}

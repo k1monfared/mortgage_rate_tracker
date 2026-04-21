@@ -131,7 +131,10 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       margin: 0 0 10px; font-size: 12px; color: var(--muted); line-height: 1.5;
     }
     .subscribe-form {
-      display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;
+      display: flex; flex-direction: column; gap: 10px; align-items: center;
+    }
+    .subscribe-row {
+      display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; width: 100%;
     }
     .subscribe-form input[type="email"] {
       flex: 1 1 220px; min-width: 180px; max-width: 300px;
@@ -150,6 +153,16 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       transition: opacity .15s;
     }
     .subscribe-form button:hover { opacity: .88; }
+    .subscribe-choices {
+      display: flex; gap: 16px; justify-content: center; flex-wrap: wrap;
+      font-size: 13px; color: var(--muted);
+    }
+    .subscribe-choices label {
+      display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    }
+    .subscribe-choices input[type="checkbox"] {
+      width: 15px; height: 15px; accent-color: var(--link); cursor: pointer;
+    }
 
     #theme-toggle {
       position: fixed; top: 12px; right: 12px;
@@ -235,12 +248,23 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="subscribe">
-    <h2>Get notified when __LABEL_PRIME__ changes</h2>
-    <p>One short email only when the rate actually moves. No daily digest, no marketing.</p>
+    <h2>Get notified when prime rates change</h2>
+    <p>One short email when a rate actually moves. Two separate lists — Canada and the US — pick either or both.</p>
     <form class="subscribe-form" action="__SUBSCRIBE_URL__" method="POST">
-      <input type="email" name="email" required placeholder="you@example.com" autocomplete="email">
-      <input type="hidden" name="list" value="__SLUG__">
-      <button type="submit">Subscribe</button>
+      <div class="subscribe-choices">
+        <label>
+          <input type="checkbox" name="lists" value="ca" __CA_CHECKED__>
+          Canadian prime rate
+        </label>
+        <label>
+          <input type="checkbox" name="lists" value="us" __US_CHECKED__>
+          US prime rate
+        </label>
+      </div>
+      <div class="subscribe-row">
+        <input type="email" name="email" required placeholder="you@example.com" autocomplete="email">
+        <button type="submit">Subscribe</button>
+      </div>
     </form>
   </div>
 
@@ -1050,6 +1074,8 @@ def render_region(cfg, build_time):
         "__SLUG__":           slug,
         "__CA_ACTIVE__":      "active" if slug == "ca" else "",
         "__US_ACTIVE__":      "active" if slug == "us" else "",
+        "__CA_CHECKED__":     "checked" if slug == "ca" else "",
+        "__US_CHECKED__":     "checked" if slug == "us" else "",
         "__BUILD_TIME__":     build_time,
         "__SUBSCRIBE_URL__":  SUBSCRIBE_PROXY_URL,
     }

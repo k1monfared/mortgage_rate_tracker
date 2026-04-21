@@ -8,41 +8,23 @@
  * send time (where Resend necessarily sees them).
  *
  * Endpoints:
- *   POST /                            subscribe: accepts email + list=ca|us,
- *                                     sends a double-opt-in confirmation email.
- *   GET  /confirm?token=…             confirmation click: writes a subscribers
- *                                     row with a fresh unsub_token.
- *   GET  /block?token=…               "never email me again" link in the
- *                                     confirmation email: silently blocks the
- *                                     address so future subscribe attempts are
- *                                     dropped.
- *   GET  /unsubscribe?token=…         one-click unsub from a broadcast email.
- *                                     Deletes the subscribers row and writes a
- *                                     permanent block:<email> KV entry.
- *   POST /unsubscribe                 same as GET for RFC 8058 list-unsub-post.
- *                                     Body is ignored; token is in the URL.
+ *   POST /                            subscribe: accepts email + lists (ca/us, one or more)
+ *                                     sends a single double-opt-in email.
+ *   GET  /confirm?token=…             confirmation click: writes one subscribers
+ *                                     row per selected list with a fresh unsub_token.
+ *   GET  /block?token=…               "never email me again" link from confirmation
+ *                                     email: permanent block of the address.
+ *   GET  /unsubscribe?token=…         one-click unsub from a broadcast email —
+ *                                     removes the one list this email was for.
+ *   POST /unsubscribe                 same as GET, for RFC 8058 list-unsub-post.
+ *   GET  /preferences?token=…         full preference center: shows every list
+ *                                     this address is subscribed to with
+ *                                     checkboxes; user picks what to keep.
+ *   POST /preferences                 saves the selected checkboxes — deletes
+ *                                     rows for lists the user unchecked.
  *   POST /broadcast                   GH Actions → worker: sends a short email
  *                                     to every confirmed subscriber for a list,
- *                                     subject to per-day dedup. Auth-guarded.
- *
- * Env (via wrangler secret put unless noted):
- *   RESEND_API_KEY                    required, transactional sends.
- *   FROM_ADDR                         required, e.g. "Mortgage Rates <…>".
- *   SITE_NAME                         required, appears in confirmation email.
- *   ALLOWED_ORIGINS                   required (vars), comma-separated origins
- *                                     allowed to POST /.
- *   CONFIRMATION_SENT_URL             required (vars).
- *   BLOCKED_URL                       required (vars).
- *   UNSUBSCRIBED_URL                  required (vars), landing after /unsubscribe.
- *   SUCCESS_URL_CA                    required (vars).
- *   SUCCESS_URL_US                    required (vars).
- *   ERROR_URL / ERROR_URL_CA / ERROR_URL_US  optional (vars).
- *   BROADCAST_AUTH_KEY                required (secret), gates POST /broadcast.
- *
- * Bindings (wrangler.toml):
- *   SUBSCRIBE_KV                      KV: pending confirmation tokens,
- *                                     rate-limit markers, permanent blocks.
- *   AUDIT_DB                          D1: subscribe_logs, subscribers, sends.
+ *                                     with per-day dedup. Auth-guarded.
  */
 
 export interface Env {
@@ -64,23 +46,26 @@ export interface Env {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const TOKEN_RE = /^[a-f0-9]{64}$/;
-const TOKEN_TTL_SECONDS = 60 * 60 * 24;        // 24h
-const RATE_LIMIT_TTL_SECONDS = 60 * 60 * 24;   // 24h
-const BLOCK_TTL_SECONDS = 10 * 365 * 24 * 60 * 60; // 10y, effectively permanent
-const RESEND_BATCH_CHUNK = 100;                // Resend's batch-endpoint limit
+const TOKEN_TTL_SECONDS = 60 * 60 * 24;
+const RATE_LIMIT_TTL_SECONDS = 60 * 60 * 24;
+const BLOCK_TTL_SECONDS = 10 * 365 * 24 * 60 * 60;
+const RESEND_BATCH_CHUNK = 100;
+const VALID_LISTS = new Set(["ca", "us"]);
 
 const LIST_LABELS: Record<string, string> = {
   ca: "Canadian mortgage prime rate",
   us: "US mortgage prime rate",
 };
 
+const SITE_HOME = "https://k1monfared.github.io/mortgage_rate_tracker/";
+
 const CONFIRMATION_TEMPLATE = {
-  subject: "Confirm your subscription to {site_name} ({list_label})",
+  subject: "Confirm your subscription to {site_name}",
   html:
     `<p>Someone (hopefully you) used the subscribe form on ` +
     `<strong>{site_name}</strong> to sign up <strong>{email}</strong> ` +
-    `for <strong>{list_label}</strong> updates.</p>` +
-    `<p>You will only receive an email when the rate actually changes — ` +
+    `for updates to {list_labels}.</p>` +
+    `<p>You will only receive an email when a rate actually changes — ` +
     `not a daily digest, not marketing.</p>` +
     `<p><a href="{confirm_url}" style="display:inline-block;padding:10px 16px;` +
     `background:#0b5394;color:#ffffff;text-decoration:none;border-radius:6px;">` +
@@ -94,8 +79,8 @@ const CONFIRMATION_TEMPLATE = {
     `contact you again, even if someone tries to subscribe you later.</p>`,
   text:
     `Someone (hopefully you) used the subscribe form on {site_name} to sign up ` +
-    `{email} for {list_label} updates.\n\n` +
-    `You will only receive an email when the rate actually changes — not a daily ` +
+    `{email} for updates to {list_labels}.\n\n` +
+    `You will only receive an email when a rate actually changes — not a daily ` +
     `digest, not marketing.\n\n` +
     `Confirm your subscription:\n{confirm_url}\n\n` +
     `The confirm link is valid for 24 hours. If you don't click it, nothing happens.\n\n` +
@@ -123,27 +108,46 @@ function originAllowed(req: Request, env: Env): boolean {
   return false;
 }
 
-async function parseSubscribeBody(req: Request): Promise<{ email: string; list: string } | null> {
+function normalizeLists(raw: string[]): string[] {
+  const cleaned = raw
+    .map((s) => s.trim().replace(/[^A-Za-z0-9_]/g, "").slice(0, 32).toLowerCase())
+    .filter((s) => VALID_LISTS.has(s));
+  return Array.from(new Set(cleaned));
+}
+
+async function parseSubscribeBody(req: Request): Promise<{ email: string; lists: string[] } | null> {
   const ct = (req.headers.get("content-type") || "").toLowerCase();
   let email = "";
-  let list = "";
+  let rawListsTokens: string[] = [];
   if (ct.includes("application/json")) {
     try {
       const body = (await req.json()) as Record<string, unknown>;
       email = String(body.email ?? "").trim();
-      list = String(body.list ?? "").trim();
+      if (Array.isArray(body.lists)) {
+        rawListsTokens = body.lists.map(String);
+      } else if (typeof body.lists === "string") {
+        rawListsTokens = (body.lists as string).split(",");
+      } else if (typeof body.list === "string") {
+        rawListsTokens = (body.list as string).split(",");
+      }
     } catch {
       return null;
     }
   } else {
     const form = await req.formData();
     email = String(form.get("email") ?? "").trim();
-    list = String(form.get("list") ?? "").trim();
+    const multiLists = form.getAll("lists").map(String);
+    const multiList  = form.getAll("list").map(String);
+    const combined = [...multiLists, ...multiList];
+    rawListsTokens = [];
+    for (const v of combined) {
+      for (const part of v.split(",")) rawListsTokens.push(part);
+    }
   }
   if (!EMAIL_RE.test(email)) return null;
-  const cleanList = list.replace(/[^A-Za-z0-9_]/g, "").slice(0, 32).toLowerCase();
-  if (cleanList !== "ca" && cleanList !== "us") return null;
-  return { email: email.toLowerCase(), list: cleanList };
+  const lists = normalizeLists(rawListsTokens);
+  if (lists.length === 0) return null;
+  return { email: email.toLowerCase(), lists };
 }
 
 function resolveUrl(env: Env, base: string, list: string): string {
@@ -166,18 +170,31 @@ function fillTemplate(tpl: string, vars: Record<string, string>): string {
   return tpl.replace(/{(\w+)}/g, (_, k) => vars[k] ?? `{${k}}`);
 }
 
-/** Constant-time string equality for auth checks. */
 function safeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let mismatch = 0;
-  for (let i = 0; i < a.length; i++) {
-    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return mismatch === 0;
 }
 
 function utcDateStr(d: Date = new Date()): string {
   return d.toISOString().slice(0, 10);
+}
+
+function formatListLabels(lists: string[]): string {
+  const labels = lists.map((l) => LIST_LABELS[l] || l);
+  if (labels.length <= 1) return labels[0] || "";
+  if (labels.length === 2) return `${labels[0]} and ${labels[1]}`;
+  return `${labels.slice(0, -1).join(", ")}, and ${labels[labels.length - 1]}`;
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 async function logEvent(
@@ -225,14 +242,14 @@ async function sendConfirmationEmail(
   to: string,
   confirmUrl: string,
   blockUrl: string,
-  list: string,
+  lists: string[],
 ): Promise<boolean> {
   const vars = {
     email: to,
     confirm_url: confirmUrl,
     block_url: blockUrl,
     site_name: env.SITE_NAME,
-    list_label: LIST_LABELS[list] || list,
+    list_labels: formatListLabels(lists),
   };
   const payload = {
     from: env.FROM_ADDR,
@@ -269,14 +286,15 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
     return respondRedirect(req, errorUrl, "Invalid email or list", false);
   }
 
-  const list = parsed.list;
-  const confirmationSentUrl = resolveUrl(env, "CONFIRMATION_SENT_URL", list);
-  const errorUrl = resolveUrl(env, "ERROR_URL", list) || `${confirmationSentUrl}?err=1`;
+  // Use the first list for per-language redirect resolution.
+  const primaryList = parsed.lists[0];
+  const confirmationSentUrl = resolveUrl(env, "CONFIRMATION_SENT_URL", primaryList);
+  const errorUrl = resolveUrl(env, "ERROR_URL", primaryList) || `${confirmationSentUrl}?err=1`;
 
   const blockKey = `block:${parsed.email}`;
   if (await env.SUBSCRIBE_KV.get(blockKey)) {
     await logEvent(env, req, "subscribe_attempt", "blocked", {
-      email: parsed.email, list,
+      email: parsed.email, list: parsed.lists.join(","),
     });
     return respondRedirect(req, confirmationSentUrl, "Already pending", true);
   }
@@ -284,7 +302,7 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
   const rateKey = `rl:${parsed.email}`;
   if (await env.SUBSCRIBE_KV.get(rateKey)) {
     await logEvent(env, req, "subscribe_attempt", "rate_limited", {
-      email: parsed.email, list,
+      email: parsed.email, list: parsed.lists.join(","),
     });
     return respondRedirect(req, confirmationSentUrl, "Already pending", true);
   }
@@ -293,7 +311,7 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
   const tokenPrefix = token.slice(0, 8);
   const record = JSON.stringify({
     email: parsed.email,
-    list: parsed.list,
+    lists: parsed.lists,
     created_at: Date.now(),
   });
   await env.SUBSCRIBE_KV.put(`token:${token}`, record, { expirationTtl: TOKEN_TTL_SECONDS });
@@ -303,22 +321,22 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
   const confirmUrl = `${workerUrl.origin}/confirm?token=${token}`;
   const blockUrl = `${workerUrl.origin}/block?token=${token}`;
 
-  const sent = await sendConfirmationEmail(env, parsed.email, confirmUrl, blockUrl, parsed.list);
+  const sent = await sendConfirmationEmail(env, parsed.email, confirmUrl, blockUrl, parsed.lists);
   if (!sent) {
     await logEvent(env, req, "subscribe_attempt", "send_failed", {
-      email: parsed.email, list, tokenPrefix,
+      email: parsed.email, list: parsed.lists.join(","), tokenPrefix,
     });
     return respondRedirect(req, errorUrl, "Send failed", false);
   }
 
   await logEvent(env, req, "subscribe_attempt", "pending", {
-    email: parsed.email, list, tokenPrefix,
+    email: parsed.email, list: parsed.lists.join(","), tokenPrefix,
   });
   return respondRedirect(req, confirmationSentUrl, "Confirmation sent", true);
 }
 
 // ---------------------------------------------------------------------------
-// GET /confirm?token=…  — finalize subscription → insert into `subscribers`
+// GET /confirm?token=…  — finalize subscription → insert one row per list
 // ---------------------------------------------------------------------------
 async function handleConfirm(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
@@ -340,7 +358,7 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
       303,
     );
   }
-  let record: { email: string; list?: string };
+  let record: { email: string; lists?: string[]; list?: string };
   try {
     record = JSON.parse(raw);
   } catch {
@@ -352,22 +370,35 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
     );
   }
 
-  const list = record.list || "ca";
-  const successUrl = resolveUrl(env, "SUCCESS_URL", list);
-  const errorUrl = resolveUrl(env, "ERROR_URL", list) || `${successUrl}?err=1`;
+  // Back-compat: older records had `list` (single).
+  const lists: string[] = record.lists
+    || (record.list ? [record.list] : []);
+  const validLists = lists.filter((l) => VALID_LISTS.has(l));
+  if (validLists.length === 0) {
+    await logEvent(env, req, "confirm_attempt", "bad_token", { tokenPrefix });
+    return Response.redirect(
+      resolveUrl(env, "ERROR_URL", "") || `${resolveUrl(env, "SUCCESS_URL_CA", "")}?err=bad_token`,
+      303,
+    );
+  }
 
-  // Insert into D1 subscribers. If already present (unique constraint on
-  // (email, list)) that's still a success — user is re-confirming.
-  const unsubToken = generateToken();
+  const primaryList = validLists[0];
+  const successUrl = resolveUrl(env, "SUCCESS_URL", primaryList);
+  const errorUrl = resolveUrl(env, "ERROR_URL", primaryList) || `${successUrl}?err=1`;
+
   try {
-    await env.AUDIT_DB.prepare(
-      `INSERT OR IGNORE INTO subscribers (email, list, confirmed_at, unsub_token)
-       VALUES (?, ?, ?, ?)`,
-    ).bind(record.email, list, new Date().toISOString(), unsubToken).run();
+    const nowIso = new Date().toISOString();
+    for (const list of validLists) {
+      const unsubToken = generateToken();
+      await env.AUDIT_DB.prepare(
+        `INSERT OR IGNORE INTO subscribers (email, list, confirmed_at, unsub_token)
+         VALUES (?, ?, ?, ?)`,
+      ).bind(record.email, list, nowIso, unsubToken).run();
+    }
   } catch (e) {
     console.error("confirm insert failed:", e);
     await logEvent(env, req, "confirm_attempt", "db_error", {
-      email: record.email, list, tokenPrefix,
+      email: record.email, list: validLists.join(","), tokenPrefix,
     });
     return Response.redirect(errorUrl, 303);
   }
@@ -376,13 +407,13 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
   await env.SUBSCRIBE_KV.delete(`rl:${record.email}`);
 
   await logEvent(env, req, "confirm_attempt", "confirmed", {
-    email: record.email, list, tokenPrefix,
+    email: record.email, list: validLists.join(","), tokenPrefix,
   });
   return Response.redirect(successUrl, 303);
 }
 
 // ---------------------------------------------------------------------------
-// GET /block?token=…  — "never email me again" link in confirmation email
+// GET /block?token=…  — "never email me again" from confirmation email
 // ---------------------------------------------------------------------------
 async function handleBlock(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
@@ -401,7 +432,7 @@ async function handleBlock(req: Request, env: Env): Promise<Response> {
     await logEvent(env, req, "block_attempt", "expired_token", { tokenPrefix });
     return Response.redirect(resolveUrl(env, "BLOCKED_URL", ""), 303);
   }
-  let record: { email: string; list?: string };
+  let record: { email: string; lists?: string[]; list?: string };
   try {
     record = JSON.parse(raw);
   } catch {
@@ -413,35 +444,34 @@ async function handleBlock(req: Request, env: Env): Promise<Response> {
     );
   }
 
-  const list = record.list || "";
   await env.SUBSCRIBE_KV.put(`block:${record.email}`, "1", { expirationTtl: BLOCK_TTL_SECONDS });
   await env.SUBSCRIBE_KV.delete(tokenKey);
   await env.SUBSCRIBE_KV.delete(`rl:${record.email}`);
-  // Also remove any existing subscriptions (defense in depth).
   await env.AUDIT_DB.prepare(`DELETE FROM subscribers WHERE email = ?`)
     .bind(record.email).run();
 
+  const listStr = (record.lists || (record.list ? [record.list] : [])).join(",");
   await logEvent(env, req, "block_attempt", "blocked", {
-    email: record.email, list, tokenPrefix,
+    email: record.email, list: listStr, tokenPrefix,
   });
-  return Response.redirect(resolveUrl(env, "BLOCKED_URL", list), 303);
+  return Response.redirect(resolveUrl(env, "BLOCKED_URL", ""), 303);
 }
 
 // ---------------------------------------------------------------------------
-// GET/POST /unsubscribe?token=…  — one-click unsub from a broadcast email
+// GET/POST /unsubscribe?token=…  — one-click unsub from ONE list
 // ---------------------------------------------------------------------------
 async function handleUnsubscribe(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const token = url.searchParams.get("token") || "";
   const tokenPrefix = token.slice(0, 8) || null;
+  const okResponse = () =>
+    req.method === "POST"
+      ? new Response("ok", { status: 200 })
+      : Response.redirect(env.UNSUBSCRIBED_URL, 303);
+
   if (!TOKEN_RE.test(token)) {
     await logEvent(env, req, "unsubscribe_attempt", "bad_token", { tokenPrefix });
-    // RFC 8058 compliance: POST requests must return 2xx on success/no-op
-    // so Gmail/Outlook don't retry and flag us.
-    if (req.method === "POST") {
-      return new Response("ok", { status: 200 });
-    }
-    return Response.redirect(env.UNSUBSCRIBED_URL, 303);
+    return okResponse();
   }
 
   const row = await env.AUDIT_DB.prepare(
@@ -450,17 +480,15 @@ async function handleUnsubscribe(req: Request, env: Env): Promise<Response> {
 
   if (!row) {
     await logEvent(env, req, "unsubscribe_attempt", "not_found", { tokenPrefix });
-    if (req.method === "POST") {
-      return new Response("ok", { status: 200 });
-    }
-    return Response.redirect(env.UNSUBSCRIBED_URL, 303);
+    return okResponse();
   }
 
   try {
     await env.AUDIT_DB.prepare(`DELETE FROM subscribers WHERE unsub_token = ?`)
       .bind(token).run();
-    await env.SUBSCRIBE_KV.put(`block:${row.email}`, "1",
-      { expirationTtl: BLOCK_TTL_SECONDS });
+    // Only blocks future subscribe attempts for THIS address if they also
+    // requested a hard block. A per-list unsubscribe should not nuke their
+    // other subscriptions — so we don't write to the block: KV here.
   } catch (e) {
     console.error("unsubscribe failed:", e);
   }
@@ -469,14 +497,186 @@ async function handleUnsubscribe(req: Request, env: Env): Promise<Response> {
     email: row.email, list: row.list, tokenPrefix,
   });
 
-  if (req.method === "POST") {
-    return new Response("ok", { status: 200 });
-  }
-  return Response.redirect(env.UNSUBSCRIBED_URL, 303);
+  return okResponse();
 }
 
 // ---------------------------------------------------------------------------
-// POST /broadcast  — send a broadcast to all confirmed subscribers for a list
+// GET/POST /preferences?token=…  — manage all of one address's subscriptions
+// ---------------------------------------------------------------------------
+function preferencesPage(token: string, email: string, currentLists: string[], savedNote: string | null): string {
+  const tokenEsc = escapeHtml(token);
+  const emailEsc = escapeHtml(email);
+  const checkboxRows = Array.from(VALID_LISTS).map((list) => {
+    const label = LIST_LABELS[list] || list;
+    const checked = currentLists.includes(list) ? "checked" : "";
+    return `<label class="row">
+      <input type="checkbox" name="keep" value="${list}" ${checked}>
+      <span>${escapeHtml(label)}</span>
+    </label>`;
+  }).join("\n");
+
+  const savedBanner = savedNote
+    ? `<p class="saved">${escapeHtml(savedNote)}</p>`
+    : "";
+
+  const currentNote = currentLists.length === 0
+    ? `<p class="muted">You currently have no active subscriptions.</p>`
+    : `<p class="muted">Uncheck any list you want to stop receiving emails for, then click Save.</p>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Email preferences · Mortgage Rate Tracker</title>
+  <style>
+    :root { color-scheme: dark light; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #1a1a2e; color: #e0e0e0;
+      margin: 0; padding: 40px 20px;
+      min-height: 100vh;
+    }
+    .box {
+      background: #16213e; border: 1px solid #30363d;
+      border-radius: 12px; padding: 32px;
+      max-width: 560px; margin: 24px auto;
+      box-shadow: 0 1px 4px rgba(0,0,0,.25);
+    }
+    h1 { margin: 0 0 6px; font-size: 1.4rem; }
+    .email { font-size: 13px; color: #8b949e; margin: 0 0 20px; }
+    .muted { font-size: 13px; color: #8b949e; line-height: 1.55; margin: 0 0 16px; }
+    .saved {
+      background: rgba(100,200,160,0.12); border: 1px solid rgba(100,200,160,0.35);
+      color: #7ee5b1; padding: 10px 14px; border-radius: 6px; font-size: 14px;
+      margin: 0 0 16px;
+    }
+    .row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 14px; margin: 6px 0;
+      background: #1a1a2e; border: 1px solid #30363d; border-radius: 8px;
+      cursor: pointer;
+    }
+    .row input { margin: 0; width: 18px; height: 18px; cursor: pointer; }
+    .row span { font-size: 15px; }
+    button {
+      display: inline-block; padding: 10px 20px; font-size: 14px; font-weight: 500;
+      background: #58a6ff; color: #0d1117; border: none; border-radius: 6px;
+      cursor: pointer; margin-top: 10px;
+    }
+    button:hover { opacity: .9; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .footer { text-align: center; font-size: 11px; color: #8b949e; margin-top: 24px; opacity: .85; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Email preferences</h1>
+    <p class="email">For: ${emailEsc}</p>
+    ${savedBanner}
+    ${currentNote}
+    <form method="POST" action="/preferences">
+      <input type="hidden" name="token" value="${tokenEsc}">
+      ${checkboxRows}
+      <button type="submit">Save changes</button>
+    </form>
+    <p class="muted" style="margin-top: 20px;">
+      <a href="${SITE_HOME}">&larr; Back to the tracker</a>
+    </p>
+  </div>
+  <div class="footer">
+    <a href="https://github.com/k1monfared/mortgage_rate_tracker">GitHub</a>
+    &middot; <a href="https://k1monfared.github.io/sponsor.html">Sponsor</a>
+  </div>
+</body>
+</html>`;
+}
+
+async function lookupByToken(env: Env, token: string): Promise<{ email: string } | null> {
+  if (!TOKEN_RE.test(token)) return null;
+  return await env.AUDIT_DB.prepare(
+    `SELECT email FROM subscribers WHERE unsub_token = ? LIMIT 1`,
+  ).bind(token).first<{ email: string }>();
+}
+
+async function listsForEmail(env: Env, email: string): Promise<string[]> {
+  const rows = await env.AUDIT_DB.prepare(
+    `SELECT list FROM subscribers WHERE email = ?`,
+  ).bind(email).all<{ list: string }>();
+  return (rows.results || []).map((r) => r.list);
+}
+
+async function handleGetPreferences(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const token = url.searchParams.get("token") || "";
+  const tokenPrefix = token.slice(0, 8) || null;
+
+  const owner = await lookupByToken(env, token);
+  if (!owner) {
+    await logEvent(env, req, "preferences_attempt", "bad_or_expired_token", { tokenPrefix });
+    return Response.redirect(env.UNSUBSCRIBED_URL, 303);
+  }
+  const lists = await listsForEmail(env, owner.email);
+  await logEvent(env, req, "preferences_attempt", "viewed", {
+    email: owner.email, tokenPrefix,
+  });
+  return new Response(preferencesPage(token, owner.email, lists, null), {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+async function handlePostPreferences(req: Request, env: Env): Promise<Response> {
+  const form = await req.formData();
+  const token = String(form.get("token") || "");
+  const tokenPrefix = token.slice(0, 8) || null;
+  const keepRaw = form.getAll("keep").map(String);
+  const keep = normalizeLists(keepRaw);
+
+  const owner = await lookupByToken(env, token);
+  if (!owner) {
+    await logEvent(env, req, "preferences_attempt", "bad_or_expired_token", { tokenPrefix });
+    return Response.redirect(env.UNSUBSCRIBED_URL, 303);
+  }
+
+  const current = await listsForEmail(env, owner.email);
+  const toRemove = current.filter((l) => !keep.includes(l));
+
+  for (const list of toRemove) {
+    await env.AUDIT_DB.prepare(
+      `DELETE FROM subscribers WHERE email = ? AND list = ?`,
+    ).bind(owner.email, list).run();
+  }
+
+  const remaining = await listsForEmail(env, owner.email);
+
+  await logEvent(env, req, "preferences_attempt", "saved", {
+    email: owner.email,
+    list: `kept=${keep.join(",")},removed=${toRemove.join(",")}`,
+    tokenPrefix,
+  });
+
+  if (remaining.length === 0) {
+    return Response.redirect(env.UNSUBSCRIBED_URL, 303);
+  }
+
+  // The token they arrived with may belong to a row we just deleted. If so,
+  // they won't be able to re-visit /preferences with it. That's fine —
+  // their remaining emails still carry valid tokens. We still render the
+  // current page from the token they used (lookup may fail on re-GET but
+  // we have the email loaded here).
+  const savedNote = toRemove.length
+    ? `Saved. Removed: ${toRemove.map((l) => LIST_LABELS[l] || l).join(", ")}.`
+    : `Saved. No changes.`;
+  return new Response(preferencesPage(token, owner.email, remaining, savedNote), {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// POST /broadcast  — fan-out to all confirmed subscribers of one list
 // ---------------------------------------------------------------------------
 interface BroadcastRequest {
   list: string;
@@ -506,7 +706,7 @@ async function handleBroadcast(req: Request, env: Env): Promise<Response> {
   }
 
   const list = (body.list || "").toLowerCase();
-  if (list !== "ca" && list !== "us") {
+  if (!VALID_LISTS.has(list)) {
     await logEvent(env, req, "broadcast_attempt", "bad_list", { list });
     return new Response(JSON.stringify({ error: "bad_list" }), {
       status: 400, headers: { "Content-Type": "application/json" },
@@ -527,25 +727,16 @@ async function handleBroadcast(req: Request, env: Env): Promise<Response> {
   ).bind(list).all<{ email: string; unsub_token: string }>();
   const candidates = rows.results || [];
 
-  let sent = 0;
-  let skippedDedup = 0;
-  let failed = 0;
+  let sent = 0, skippedDedup = 0, failed = 0;
 
-  // Pre-filter using per-day dedup: INSERT OR IGNORE; accept rows whose
-  // insert actually produced a new row (changes() === 1). D1 serializes
-  // these inserts, so there is no race.
   const accepted: { email: string; unsub_token: string }[] = [];
   for (const row of candidates) {
     const result = await env.AUDIT_DB.prepare(
       `INSERT OR IGNORE INTO sends (email, list, date_sent) VALUES (?, ?, ?)`,
     ).bind(row.email, list, today).run();
-    // meta.changes === 1 when a new row was inserted, 0 when blocked by unique.
     const changes = (result.meta && (result.meta.changes ?? 0)) || 0;
-    if (changes > 0) {
-      accepted.push(row);
-    } else {
-      skippedDedup++;
-    }
+    if (changes > 0) accepted.push(row);
+    else skippedDedup++;
   }
 
   if (accepted.length === 0) {
@@ -556,17 +747,21 @@ async function handleBroadcast(req: Request, env: Env): Promise<Response> {
     );
   }
 
-  // Batch-send via Resend /emails/batch in chunks.
   for (let i = 0; i < accepted.length; i += RESEND_BATCH_CHUNK) {
     const chunk = accepted.slice(i, i + RESEND_BATCH_CHUNK);
     const envelopes = chunk.map((row) => {
       const unsubUrl = `${workerOrigin}/unsubscribe?token=${row.unsub_token}`;
+      const prefsUrl = `${workerOrigin}/preferences?token=${row.unsub_token}`;
       return {
         from: env.FROM_ADDR,
         to: [row.email],
         subject: body.subject,
-        html: body.html.replace(/{{UNSUB_URL}}/g, unsubUrl),
-        text: body.text.replace(/{{UNSUB_URL}}/g, unsubUrl),
+        html: body.html
+          .replace(/{{UNSUB_URL}}/g, unsubUrl)
+          .replace(/{{PREFS_URL}}/g, prefsUrl),
+        text: body.text
+          .replace(/{{UNSUB_URL}}/g, unsubUrl)
+          .replace(/{{PREFS_URL}}/g, prefsUrl),
         headers: {
           "List-Unsubscribe": `<${unsubUrl}>`,
           "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
@@ -588,9 +783,6 @@ async function handleBroadcast(req: Request, env: Env): Promise<Response> {
         await logEvent(env, req, "broadcast_attempt", "sent_chunk", { list });
       } else {
         failed += chunk.length;
-        // Roll back the sends rows for this chunk so the recipient can
-        // still receive this change the next day (or on retry, but per-day
-        // dedup still holds for the current UTC day).
         for (const row of chunk) {
           await env.AUDIT_DB.prepare(
             `DELETE FROM sends WHERE email = ? AND list = ? AND date_sent = ?`,
@@ -622,22 +814,15 @@ async function handleBroadcast(req: Request, env: Env): Promise<Response> {
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
-    if (req.method === "POST" && url.pathname === "/") {
-      return handleSubscribe(req, env);
-    }
-    if (req.method === "GET" && url.pathname === "/confirm") {
-      return handleConfirm(req, env);
-    }
-    if (req.method === "GET" && url.pathname === "/block") {
-      return handleBlock(req, env);
-    }
-    if (url.pathname === "/unsubscribe"
-        && (req.method === "GET" || req.method === "POST")) {
+    if (req.method === "POST" && url.pathname === "/") return handleSubscribe(req, env);
+    if (req.method === "GET"  && url.pathname === "/confirm") return handleConfirm(req, env);
+    if (req.method === "GET"  && url.pathname === "/block") return handleBlock(req, env);
+    if (url.pathname === "/unsubscribe" && (req.method === "GET" || req.method === "POST")) {
       return handleUnsubscribe(req, env);
     }
-    if (req.method === "POST" && url.pathname === "/broadcast") {
-      return handleBroadcast(req, env);
-    }
+    if (req.method === "GET"  && url.pathname === "/preferences") return handleGetPreferences(req, env);
+    if (req.method === "POST" && url.pathname === "/preferences") return handlePostPreferences(req, env);
+    if (req.method === "POST" && url.pathname === "/broadcast") return handleBroadcast(req, env);
     return new Response("Not Found", { status: 404 });
   },
 };
