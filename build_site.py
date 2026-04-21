@@ -30,7 +30,7 @@ from historical_rates import HistoricalRateFetcher
 
 # URL of the deployed Cloudflare Worker that accepts subscribe form POSTs.
 # Update this after `wrangler deploy` if the workers.dev subdomain differs.
-SUBSCRIBE_PROXY_URL = "https://mortgage-rates-subscribe-proxy.k1monfared.workers.dev"
+SUBSCRIBE_PROXY_URL = "https://mortgage-rates-subscribe-proxy.usraelwar.workers.dev"
 
 
 # ---------------------------------------------------------------------------

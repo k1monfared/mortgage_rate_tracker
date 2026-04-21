@@ -36,7 +36,7 @@ ERROR_URL_US   = "https://k1monfared.github.io/mortgage_rate_tracker/us/?err=1"
 # Then replace the placeholder id below with the printed one.
 [[kv_namespaces]]
 binding = "SUBSCRIBE_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "941a37701b71480c984836115eb4de17"
 
 # D1 database: audit log + subscribers list + per-day sends ledger.
 # Create one with: npx wrangler d1 create mortgage-subscribe-audit
@@ -45,4 +45,4 @@ id = "REPLACE_WITH_KV_NAMESPACE_ID"
 [[d1_databases]]
 binding = "AUDIT_DB"
 database_name = "mortgage-subscribe-audit"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "22d90559-917b-4583-9b6f-b7843e6721c9"
