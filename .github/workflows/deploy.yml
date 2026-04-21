@@ -26,10 +26,8 @@ jobs:
         run: python build_site.py
       - name: Send rate-change emails
         env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          AUDIENCE_ID_CA: ${{ secrets.AUDIENCE_ID_CA }}
-          AUDIENCE_ID_US: ${{ secrets.AUDIENCE_ID_US }}
-          FROM_ADDR: ${{ vars.FROM_ADDR }}
+          SUBSCRIBE_PROXY_URL: ${{ vars.SUBSCRIBE_PROXY_URL }}
+          BROADCAST_AUTH_KEY: ${{ secrets.BROADCAST_AUTH_KEY }}
           SENDER_BASE_URL: https://k1monfared.github.io/mortgage_rate_tracker
         run: python send_rate_emails.py
       - name: Commit rate_changes.json on detected change

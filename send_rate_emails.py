@@ -3,8 +3,10 @@ Rate-change email sender.
 
 Compares the latest commercial prime rate in each region's CSV against the
 known-change history in data/rate_changes.json. When a new change is detected,
-sends a short broadcast via the Resend API to that region's audience and
-updates the state file to include the new change (keeping only the last 3).
+POSTs an email payload to the subscribe-proxy Cloudflare Worker at
+/broadcast; the worker fans the email out to every confirmed subscriber for
+that region, with per-day dedup. This keeps the subscriber list off this
+machine and off GitHub — GitHub Actions never sees an email address.
 
 State file schema (data/rate_changes.json):
 
@@ -20,16 +22,14 @@ State file schema (data/rate_changes.json):
       "us": { ... }
     }
 
-changes[0] is the most recent. The file is committed back to the repo by the
-Monday keep-alive step in .github/workflows/deploy.yml; this script only
-writes it (the workflow does the git push).
+changes[0] is the most recent.
 
 Env vars required to actually send:
-  RESEND_API_KEY          Resend API key with broadcast send permission
-  AUDIENCE_ID_CA          Resend audience UUID for the CA list
-  AUDIENCE_ID_US          Resend audience UUID for the US list
-  FROM_ADDR               e.g. "Mortgage Rates <rates@yourdomain>"
-  SENDER_BASE_URL         optional, defaults to https://k1monfared.github.io/mortgage_rate_tracker
+  SUBSCRIBE_PROXY_URL     URL of the deployed worker, e.g.
+                          https://mortgage-rates-subscribe-proxy.k1.workers.dev
+  BROADCAST_AUTH_KEY      shared secret also set on the worker
+  SENDER_BASE_URL         optional, defaults to
+                          https://k1monfared.github.io/mortgage_rate_tracker
 
 If any required env var is missing the script still updates the state file
 and logs what *would* have been sent, so local dry-runs are safe. Set
@@ -58,14 +58,12 @@ REGIONS: Dict[str, Dict[str, str]] = {
         "label": "Canadian Commercial Prime Rate",
         "short_label": "CA mortgage prime rate",
         "csv": str(DATA_DIR / "commercial_prime_rate.csv"),
-        "audience_env": "AUDIENCE_ID_CA",
         "page_path": "/ca/",
     },
     "us": {
         "label": "US Bank Prime Rate",
         "short_label": "US mortgage prime rate",
         "csv": str(DATA_DIR / "us_prime_rate.csv"),
-        "audience_env": "AUDIENCE_ID_US",
         "page_path": "/us/",
     },
 }
@@ -97,11 +95,7 @@ def save_state(state: Dict) -> None:
 # Change detection
 # ---------------------------------------------------------------------------
 def extract_recent_changes(csv_path: Path, limit: int = HISTORY_LENGTH) -> List[Dict]:
-    """Return the last `limit` distinct-value transitions, newest first.
-
-    A "change" is a row whose rate differs from the row immediately before it.
-    The very first row of the dataset counts as a change (series onset).
-    """
+    """Return the last `limit` distinct-value transitions, newest first."""
     df = pd.read_csv(csv_path)
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
@@ -116,28 +110,12 @@ def extract_recent_changes(csv_path: Path, limit: int = HISTORY_LENGTH) -> List[
             changes.append({"date": row["date"].strftime("%Y-%m-%d"), "value": rate})
         prev_rate = rate
 
-    # Newest first, trimmed.
     return list(reversed(changes))[:limit]
 
 
-def changes_are_equal(a: List[Dict], b: List[Dict]) -> bool:
-    if len(a) != len(b):
-        return False
-    for x, y in zip(a, b):
-        if x.get("date") != y.get("date"):
-            return False
-        if float(x.get("value", 0)) != float(y.get("value", 0)):
-            return False
-    return True
-
-
 def merge_new_change(stored: List[Dict], latest_from_csv: List[Dict]) -> Tuple[List[Dict], bool]:
-    """Given the stored history and the freshly computed history, return
-    (new_history, newest_change_detected).
-
-    - If the top entry in the CSV history matches the top of stored, no change.
-    - Otherwise the CSV top is a new change; prepend it to stored and trim.
-    """
+    """Given stored history and freshly-computed history, return
+    (new_history, a_new_change_was_detected)."""
     if not latest_from_csv:
         return stored, False
     if stored and stored[0].get("date") == latest_from_csv[0]["date"] \
@@ -152,13 +130,12 @@ def merge_new_change(stored: List[Dict], latest_from_csv: List[Dict]) -> Tuple[L
 # Email composition
 # ---------------------------------------------------------------------------
 def days_between(a: str, b: str) -> int:
-    da = pd.to_datetime(a)
-    db = pd.to_datetime(b)
-    return int(abs((db - da).days))
+    return int(abs((pd.to_datetime(b) - pd.to_datetime(a)).days))
 
 
 def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[str, str]:
-    """Build subject + html + text for a broadcast announcing the newest change."""
+    """Build subject + html + text for a broadcast announcing the newest change.
+    `{{UNSUB_URL}}` placeholder is substituted by the worker per recipient."""
     cfg = REGIONS[region_slug]
     newest = history[0]
     rate_pct = f"{newest['value']:.2f}%"
@@ -186,83 +163,75 @@ def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[
 <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
 <p style="font-size:12px;color:#666;">
   You are receiving this because you subscribed to {cfg['short_label']} updates.
-  <a href="{{{{{{RESEND_UNSUBSCRIBE_URL}}}}}}" style="color:#666;">Unsubscribe</a>
+  <a href="{{{{UNSUB_URL}}}}" style="color:#666;">Unsubscribe</a>
   &middot; <a href="https://k1monfared.github.io/sponsor.html" style="color:#666;">Support</a>
 </p>
 </body></html>"""
 
-    text_sentences = []
-    text_sentences.append(
-        f"The {cfg['label']} changed to {rate_pct} on {newest['date']}."
-    )
+    text_lines = [
+        f"The {cfg['label']} changed to {rate_pct} on {newest['date']}.",
+    ]
     if len(history) >= 2:
         prev = history[1]
         days = days_between(prev["date"], newest["date"])
-        text_sentences.append(
+        text_lines.append(
             f"Previously it was {prev['value']:.2f}%, effective {prev['date']} ({days} days)."
         )
     if len(history) >= 3:
         older = history[2]
-        text_sentences.append(f"Before that, {older['value']:.2f}% on {older['date']}.")
-    text_sentences.append(f"\nView the full chart: {page_url}")
-    text_sentences.append("Unsubscribe: {{{RESEND_UNSUBSCRIBE_URL}}}")
-    text_sentences.append("Support: https://k1monfared.github.io/sponsor.html")
+        text_lines.append(f"Before that, {older['value']:.2f}% on {older['date']}.")
+    text_lines.append("")
+    text_lines.append(f"View the full chart: {page_url}")
+    text_lines.append("Unsubscribe: {{UNSUB_URL}}")
+    text_lines.append("Support: https://k1monfared.github.io/sponsor.html")
 
-    return {"subject": subject, "html": html, "text": "\n".join(text_sentences)}
+    return {"subject": subject, "html": html, "text": "\n".join(text_lines)}
 
 
 # ---------------------------------------------------------------------------
-# Resend broadcast send
+# Dispatch via subscribe-proxy worker
 # ---------------------------------------------------------------------------
-def send_broadcast(audience_id: str, from_addr: str, email: Dict[str, str], api_key: str) -> bool:
-    """Create and send a Resend broadcast to the given audience.
-
-    Uses the two-step broadcast API: POST /broadcasts to create, POST
-    /broadcasts/{id}/send to send. Returns True on success.
-    """
-    create_resp = requests.post(
-        "https://api.resend.com/broadcasts",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "audience_id": audience_id,
-            "from": from_addr,
-            "subject": email["subject"],
-            "html": email["html"],
-            "text": email["text"],
-        },
-        timeout=30,
-    )
-    if not create_resp.ok:
-        print(f"❌ Resend create failed: {create_resp.status_code} {create_resp.text}",
-              file=sys.stderr)
-        return False
-    broadcast_id = create_resp.json().get("id")
-    if not broadcast_id:
-        print(f"❌ Resend create returned no id: {create_resp.text}", file=sys.stderr)
+def send_via_proxy(list_slug: str, email: Dict[str, str],
+                   proxy_url: str, auth_key: str) -> bool:
+    url = proxy_url.rstrip("/") + "/broadcast"
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {auth_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "list":    list_slug,
+                "subject": email["subject"],
+                "html":    email["html"],
+                "text":    email["text"],
+            },
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        print(f"  ❌ POST /broadcast failed: {e}", file=sys.stderr)
         return False
 
-    send_resp = requests.post(
-        f"https://api.resend.com/broadcasts/{broadcast_id}/send",
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=30,
-    )
-    if not send_resp.ok:
-        print(f"❌ Resend send failed: {send_resp.status_code} {send_resp.text}",
-              file=sys.stderr)
+    if not resp.ok:
+        print(f"  ❌ Worker returned {resp.status_code}: {resp.text}", file=sys.stderr)
         return False
-    print(f"✓ Broadcast {broadcast_id} queued")
+
+    try:
+        data = resp.json()
+        print(f"  ✓ Worker accepted: sent={data.get('sent', 0)}, "
+              f"skipped_dedup={data.get('skipped_dedup', 0)}, "
+              f"failed={data.get('failed', 0)}")
+    except Exception:
+        print(f"  ✓ Worker returned {resp.status_code} (non-JSON body)")
     return True
 
 
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-def process_region(slug: str, state: Dict, api_key: Optional[str], from_addr: Optional[str],
-                   base_url: str, dry_run: bool) -> Dict:
-    """Update state[slug] in place. Returns the region's new state block."""
+def process_region(slug: str, state: Dict, proxy_url: Optional[str],
+                   auth_key: Optional[str], base_url: str, dry_run: bool) -> Dict:
     cfg = REGIONS[slug]
     csv_path = Path(cfg["csv"])
     if not csv_path.exists():
@@ -278,10 +247,8 @@ def process_region(slug: str, state: Dict, api_key: Optional[str], from_addr: Op
     stored = region_block.get("changes", [])
 
     if not stored:
-        # First-ever run for this region: seed and send nothing.
         print(f"[{slug}] Seeding initial history with last {len(latest)} changes.")
-        region_block = {"series": cfg["label"], "changes": latest}
-        return region_block
+        return {"series": cfg["label"], "changes": latest}
 
     merged, new_change = merge_new_change(stored, latest)
     region_block = {"series": cfg["label"], "changes": merged}
@@ -293,40 +260,35 @@ def process_region(slug: str, state: Dict, api_key: Optional[str], from_addr: Op
     newest = merged[0]
     print(f"[{slug}] New change detected: {newest['date']} -> {newest['value']}%")
 
-    # Compose email from the merged (post-update) history, which has the
-    # newest change as [0] and the previous one(s) as [1..].
     email = compose_email(slug, merged, base_url)
     print(f"  subject: {email['subject']}")
     print(f"  page:    {base_url.rstrip('/')}{cfg['page_path']}")
 
-    audience_id = os.environ.get(cfg["audience_env"])
-
     if dry_run:
         print("  DRY_RUN=1 set — skipping actual send.")
-    elif not api_key or not from_addr or not audience_id:
+    elif not proxy_url or not auth_key:
         missing = [
             name for name, val in [
-                ("RESEND_API_KEY", api_key),
-                ("FROM_ADDR", from_addr),
-                (cfg["audience_env"], audience_id),
+                ("SUBSCRIBE_PROXY_URL", proxy_url),
+                ("BROADCAST_AUTH_KEY",  auth_key),
             ] if not val
         ]
         print(f"  ⚠️  Skipping send — missing env: {', '.join(missing)}")
     else:
-        send_broadcast(audience_id, from_addr, email, api_key)
+        send_via_proxy(slug, email, proxy_url, auth_key)
 
     return region_block
 
 
 def main() -> int:
-    api_key   = os.environ.get("RESEND_API_KEY")
-    from_addr = os.environ.get("FROM_ADDR")
+    proxy_url = os.environ.get("SUBSCRIBE_PROXY_URL")
+    auth_key  = os.environ.get("BROADCAST_AUTH_KEY")
     base_url  = os.environ.get("SENDER_BASE_URL", DEFAULT_BASE_URL)
     dry_run   = os.environ.get("DRY_RUN") == "1"
 
     state = load_state()
     for slug in REGIONS:
-        state[slug] = process_region(slug, state, api_key, from_addr, base_url, dry_run)
+        state[slug] = process_region(slug, state, proxy_url, auth_key, base_url, dry_run)
 
     save_state(state)
     return 0

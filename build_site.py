@@ -216,8 +216,6 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
   <div class="controls">
     <button class="btn" id="toggleEvents">Show Historical Events</button>
     <button class="btn" id="resetZoom">Reset Zoom</button>
-    <button class="btn" id="refreshBtn">Refresh Data</button>
-    <span id="refreshStatus"></span>
   </div>
 
   <div class="chart-wrap">
@@ -258,13 +256,10 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
   var rates, events, chart, eventsVisible = false, dotsVisible = false;
   var THREE_YEARS_MS = 3 * 365.25 * 24 * 3600 * 1000;
 
-  // ── Region / data-source config (substituted by build_site.py) ─────────
+  // ── Region config (substituted by build_site.py) ───────────────────────
   var SLUG         = '__SLUG__';
-  var REFRESH_API  = '__REFRESH_API__';   // 'boc' or 'fred'
-  var SERIES_POLICY = '__SERIES_POLICY__';
-  var SERIES_PRIME  = '__SERIES_PRIME__';
-  var LABEL_POLICY  = '__LABEL_POLICY__';
-  var LABEL_PRIME   = '__LABEL_PRIME__';
+  var LABEL_POLICY = '__LABEL_POLICY__';
+  var LABEL_PRIME  = '__LABEL_PRIME__';
   var STATE_KEY    = 'tracker.state.' + SLUG;
 
   // ── Theme palette (reads live CSS variables so it tracks the toggle) ───
@@ -412,106 +407,6 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
         { data: rates.policy.map(function(d) { return [d.date, d.rate]; }) },
         { data: rates.prime.map(function(d)  { return [d.date, d.rate]; }) },
       ],
-    });
-  }
-
-  // ── Fetch new records: BoC JSON or FRED CSV ─────────────────────────────
-  function fetchBoCJson(series, startDate, endDate) {
-    var url = 'https://www.bankofcanada.ca/valet/observations/'
-              + series + '/json?start_date=' + startDate + '&end_date=' + endDate;
-    return fetch(url)
-      .then(function(r) {
-        if (!r.ok) throw new Error('BoC API returned ' + r.status);
-        return r.json();
-      })
-      .then(function(data) {
-        var obs = data.observations || [];
-        return obs
-          .filter(function(o) { return o[series] && o[series].v != null; })
-          .map(function(o) { return { date: o.d, rate: parseFloat(o[series].v) }; })
-          .filter(function(d) { return !isNaN(d.rate); });
-      });
-  }
-
-  function fetchFREDCsv(series, startDate, endDate) {
-    var url = 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=' + series
-              + '&cosd=' + startDate + '&coed=' + endDate;
-    return fetch(url)
-      .then(function(r) {
-        if (!r.ok) throw new Error('FRED returned ' + r.status);
-        return r.text();
-      })
-      .then(function(text) {
-        var lines = text.trim().split('\n');
-        var out = [];
-        for (var i = 1; i < lines.length; i++) {
-          var parts = lines[i].split(',');
-          if (parts.length < 2) continue;
-          var v = parseFloat(parts[1]);
-          if (isNaN(v)) continue;   // skips "." missing-value rows
-          out.push({ date: parts[0], rate: v });
-        }
-        return out;
-      });
-  }
-
-  function fetchSeriesRange(series, startDate, endDate) {
-    return REFRESH_API === 'fred'
-      ? fetchFREDCsv(series, startDate, endDate)
-      : fetchBoCJson(series, startDate, endDate);
-  }
-
-  // ── Refresh button handler ─────────────────────────────────────────────
-  function refreshData() {
-    var btn    = document.getElementById('refreshBtn');
-    var status = document.getElementById('refreshStatus');
-    btn.disabled = true;
-    btn.textContent = 'Refreshing…';
-    status.textContent = '';
-
-    var policyStart = nextDay(rates.policy[rates.policy.length - 1].date);
-    var primeStart  = nextDay(rates.prime[rates.prime.length - 1].date);
-    var end = today();
-
-    Promise.all([
-      fetchSeriesRange(SERIES_POLICY, policyStart, end),
-      fetchSeriesRange(SERIES_PRIME,  primeStart,  end),
-    ])
-    .then(function(results) {
-      var newPolicy = results[0];
-      var newPrime  = results[1];
-      var total = newPolicy.length + newPrime.length;
-
-      if (total === 0) {
-        status.textContent = 'Already up to date.';
-      } else {
-        rates.policy = rates.policy.concat(newPolicy);
-        rates.prime  = rates.prime.concat(newPrime);
-
-        if (newPolicy.length > 0) {
-          var lp = newPolicy[newPolicy.length - 1];
-          rates.meta.policy_current      = lp.rate;
-          rates.meta.policy_current_date = lp.date;
-        }
-        if (newPrime.length > 0) {
-          var lpr = newPrime[newPrime.length - 1];
-          rates.meta.prime_current      = lpr.rate;
-          rates.meta.prime_current_date = lpr.date;
-        }
-
-        updateStatBoxes();
-        updateChartSeries();
-        status.textContent = '✓ Added ' + total + ' new record' + (total > 1 ? 's' : '') + '.';
-      }
-
-      btn.textContent = 'Refresh Data';
-      btn.disabled = false;
-    })
-    .catch(function(e) {
-      console.error('Refresh failed:', e);
-      status.textContent = 'Error fetching data — check console.';
-      btn.textContent = 'Refresh Data';
-      btn.disabled = false;
     });
   }
 
@@ -692,9 +587,6 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     document.getElementById('toggleEvents').addEventListener('click', function() {
       setEventsVisible(!eventsVisible);
     });
-
-    // Refresh button
-    document.getElementById('refreshBtn').addEventListener('click', refreshData);
 
     // Reset Zoom button
     document.getElementById('resetZoom').addEventListener('click', function() {
@@ -1061,6 +953,15 @@ STATIC_PAGES = {
             "any email to this address. Sorry for the hassle.</p>"
         ),
     },
+    "unsubscribed": {
+        "title":   "Unsubscribed",
+        "heading": "You're unsubscribed",
+        "body": (
+            "<p class='lede'>We won't email this address again.</p>"
+            "<p>If you change your mind, you can resubscribe from the tracker "
+            "page at any time.</p>"
+        ),
+    },
 }
 
 
@@ -1089,8 +990,6 @@ REGIONS = [
         "source_name": "Bank of Canada Valet API",
         "source_url":  "https://www.bankofcanada.ca/valet/docs",
         "events_file": Path("data/events.json"),
-        "series":      {"policy": "V122530", "prime": "V80691311"},
-        "refresh_api": "boc",
     },
     {
         "slug": "us",
@@ -1101,8 +1000,6 @@ REGIONS = [
         "source_name": "Federal Reserve Economic Data (FRED)",
         "source_url":  "https://fred.stlouisfed.org/",
         "events_file": Path("data/us_events.json"),
-        "series":      {"policy": "DFF", "prime": "DPRIME"},
-        "refresh_api": "fred",
     },
 ]
 
@@ -1150,10 +1047,7 @@ def render_region(cfg, build_time):
         "__LABEL_PRIME__":    cfg["labels"]["prime"],
         "__SOURCE_NAME__":    cfg["source_name"],
         "__SOURCE_URL__":     cfg["source_url"],
-        "__SERIES_POLICY__":  cfg["series"]["policy"],
-        "__SERIES_PRIME__":   cfg["series"]["prime"],
         "__SLUG__":           slug,
-        "__REFRESH_API__":    cfg["refresh_api"],
         "__CA_ACTIVE__":      "active" if slug == "ca" else "",
         "__US_ACTIVE__":      "active" if slug == "us" else "",
         "__BUILD_TIME__":     build_time,
