@@ -28,6 +28,10 @@ from pathlib import Path
 from fred_rates import FREDRateFetcher
 from historical_rates import HistoricalRateFetcher
 
+# URL of the deployed Cloudflare Worker that accepts subscribe form POSTs.
+# Update this after `wrangler deploy` if the workers.dev subdomain differs.
+SUBSCRIBE_PROXY_URL = "https://mortgage-rates-subscribe-proxy.k1monfared.workers.dev"
+
 
 # ---------------------------------------------------------------------------
 # Region page template — uses __TOKEN__ placeholders for per-region strings.
@@ -115,6 +119,38 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     }
     .description strong { color: var(--text); }
 
+    .subscribe {
+      max-width: 520px; margin: 24px auto 0; padding: 14px 16px;
+      background: var(--card-bg); border: 1px solid var(--card-border);
+      border-radius: 10px; text-align: center;
+    }
+    .subscribe h2 {
+      margin: 0 0 4px; font-size: 0.95rem; font-weight: 600; color: var(--text);
+    }
+    .subscribe p {
+      margin: 0 0 10px; font-size: 12px; color: var(--muted); line-height: 1.5;
+    }
+    .subscribe-form {
+      display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;
+    }
+    .subscribe-form input[type="email"] {
+      flex: 1 1 220px; min-width: 180px; max-width: 300px;
+      padding: 9px 12px; font-size: 14px;
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--card-border); border-radius: 6px;
+    }
+    .subscribe-form input[type="email"]:focus {
+      outline: none; border-color: var(--link);
+    }
+    .subscribe-form button {
+      padding: 9px 18px; font-size: 14px;
+      background: var(--link); color: #fff;
+      border: 1px solid var(--link); border-radius: 6px;
+      cursor: pointer; font-weight: 500;
+      transition: opacity .15s;
+    }
+    .subscribe-form button:hover { opacity: .88; }
+
     #theme-toggle {
       position: fixed; top: 12px; right: 12px;
       width: 36px; height: 36px; border-radius: 50%;
@@ -198,6 +234,16 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     above the policy rate. Hover over the chart to read exact values for any
     date. Zoom in to under three years to see individual announcement dots
     on the line.</p>
+  </div>
+
+  <div class="subscribe">
+    <h2>Get notified when __LABEL_PRIME__ changes</h2>
+    <p>One short email only when the rate actually moves. No daily digest, no marketing.</p>
+    <form class="subscribe-form" action="__SUBSCRIBE_URL__" method="POST">
+      <input type="email" name="email" required placeholder="you@example.com" autocomplete="email">
+      <input type="hidden" name="list" value="__SLUG__">
+      <button type="submit">Subscribe</button>
+    </form>
   </div>
 
   <div class="footer">
@@ -923,6 +969,114 @@ LANDING_TEMPLATE = r"""<!DOCTYPE html>
 
 
 # ---------------------------------------------------------------------------
+# Small static pages used by the subscribe flow (confirmation-sent, subscribed,
+# blocked). Rendered once with shared styling; body/heading are substituted.
+# ---------------------------------------------------------------------------
+STATIC_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>__TITLE__ &middot; Mortgage Rate Tracker</title>
+  <link rel="stylesheet" href="https://k1monfared.github.io/site_kit/css/base.css">
+  <script src="https://k1monfared.github.io/site_kit/js/theme.js"></script>
+  <style>
+    :root {
+      --card-bg: #16213e;
+      --card-border: #30363d;
+      --muted: #8b949e;
+    }
+    [data-theme="light"] {
+      --card-bg: #ffffff;
+      --card-border: #e1e4e8;
+      --muted: #6a737d;
+    }
+    body {
+      margin: 0; padding: 40px 20px;
+      background: var(--bg); color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex; flex-direction: column;
+      transition: background .2s, color .2s;
+    }
+    .box {
+      background: var(--card-bg); border: 1px solid var(--card-border);
+      border-radius: 12px; padding: 32px;
+      max-width: 520px; margin: 40px auto 0;
+      box-shadow: 0 1px 4px rgba(0,0,0,.18);
+    }
+    h1 { margin: 0 0 12px; font-size: 1.4rem; }
+    p { margin: 0 0 12px; line-height: 1.6; color: var(--muted); }
+    p.lede { color: var(--text); }
+    a { color: var(--link); }
+    a:hover { color: var(--link-hover); }
+    .footer {
+      margin-top: auto; padding-top: 32px;
+      text-align: center; font-size: 11px; color: var(--muted); opacity: .85;
+    }
+    .footer a { color: var(--link); text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>__HEADING__</h1>
+    __BODY__
+    <p><a href="/mortgage_rate_tracker/">&larr; Back to the tracker</a></p>
+  </div>
+  <div class="footer">
+    <a href="https://github.com/k1monfared/mortgage_rate_tracker" target="_blank" rel="external noopener">GitHub</a>
+    &middot; <a href="https://k1monfared.github.io/sponsor.html" rel="external noopener">Sponsor</a>
+  </div>
+</body>
+</html>
+"""
+
+
+STATIC_PAGES = {
+    "confirmation-sent": {
+        "title":   "Check your email",
+        "heading": "Almost there",
+        "body": (
+            "<p class='lede'>We just sent you a confirmation email. "
+            "Click the link inside to activate your subscription.</p>"
+            "<p>The link is valid for 24 hours. If you don't see the email, "
+            "check your spam folder.</p>"
+        ),
+    },
+    "subscribed": {
+        "title":   "Subscribed",
+        "heading": "You're subscribed",
+        "body": (
+            "<p class='lede'>We'll email you only when the rate actually changes.</p>"
+            "<p>Every email includes a one-click unsubscribe link.</p>"
+        ),
+    },
+    "blocked": {
+        "title":   "Address blocked",
+        "heading": "We won't contact you again",
+        "body": (
+            "<p class='lede'>This address has been blocked from subscribing.</p>"
+            "<p>Even if someone tries to subscribe you again later, we will not send "
+            "any email to this address. Sorry for the hassle.</p>"
+        ),
+    },
+}
+
+
+def render_static(page_id: str) -> str:
+    cfg = STATIC_PAGES[page_id]
+    html = STATIC_TEMPLATE
+    for token, value in [
+        ("__TITLE__",   cfg["title"]),
+        ("__HEADING__", cfg["heading"]),
+        ("__BODY__",    cfg["body"]),
+    ]:
+        html = html.replace(token, value)
+    return html
+
+
+# ---------------------------------------------------------------------------
 # Region configuration
 # ---------------------------------------------------------------------------
 REGIONS = [
@@ -1003,6 +1157,7 @@ def render_region(cfg, build_time):
         "__CA_ACTIVE__":      "active" if slug == "ca" else "",
         "__US_ACTIVE__":      "active" if slug == "us" else "",
         "__BUILD_TIME__":     build_time,
+        "__SUBSCRIBE_URL__":  SUBSCRIBE_PROXY_URL,
     }
     html = REGION_TEMPLATE
     for token, value in substitutions.items():
@@ -1048,6 +1203,12 @@ def build_site():
 
     (site_dir / "index.html").write_text(render_landing(build_time), encoding="utf-8")
     print(f"Built landing page: {site_dir / 'index.html'}")
+
+    for page_id in STATIC_PAGES:
+        page_dir = site_dir / page_id
+        page_dir.mkdir(parents=True, exist_ok=True)
+        (page_dir / "index.html").write_text(render_static(page_id), encoding="utf-8")
+        print(f"Built static page: {page_dir / 'index.html'}")
 
 
 if __name__ == "__main__":

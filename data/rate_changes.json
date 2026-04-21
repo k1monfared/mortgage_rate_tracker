@@ -1,0 +1,36 @@
+{
+  "ca": {
+    "changes": [
+      {
+        "date": "2025-11-05",
+        "value": 4.45
+      },
+      {
+        "date": "2025-09-24",
+        "value": 4.7
+      },
+      {
+        "date": "2025-03-19",
+        "value": 4.95
+      }
+    ],
+    "series": "Canadian Commercial Prime Rate"
+  },
+  "us": {
+    "changes": [
+      {
+        "date": "2025-12-11",
+        "value": 6.75
+      },
+      {
+        "date": "2025-10-30",
+        "value": 7.0
+      },
+      {
+        "date": "2025-09-17",
+        "value": 7.25
+      }
+    ],
+    "series": "US Bank Prime Rate"
+  }
+}

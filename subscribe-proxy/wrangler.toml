@@ -1,0 +1,50 @@
+name = "mortgage-rates-subscribe-proxy"
+main = "src/worker.ts"
+compatibility_date = "2025-01-01"
+
+# Non-secret config. Override per-deployment by editing this file. Secrets
+# (RESEND_API_KEY, AUDIENCE_ID_CA, AUDIENCE_ID_US) are set with
+# `wrangler secret put`, never committed.
+[vars]
+SITE_NAME = "Mortgage Rate Tracker"
+FROM_ADDR = "Mortgage Rate Tracker <mortgage_rate_tracker@k1monfared.com>"
+ALLOWED_ORIGINS = "https://k1monfared.github.io"
+
+# CA paths
+CONFIRMATION_SENT_URL_CA = "https://k1monfared.github.io/mortgage_rate_tracker/confirmation-sent/"
+SUCCESS_URL_CA           = "https://k1monfared.github.io/mortgage_rate_tracker/subscribed/?list=ca"
+BLOCKED_URL_CA           = "https://k1monfared.github.io/mortgage_rate_tracker/blocked/"
+ERROR_URL_CA             = "https://k1monfared.github.io/mortgage_rate_tracker/ca/?err=1"
+
+# US paths
+CONFIRMATION_SENT_URL_US = "https://k1monfared.github.io/mortgage_rate_tracker/confirmation-sent/"
+SUCCESS_URL_US           = "https://k1monfared.github.io/mortgage_rate_tracker/subscribed/?list=us"
+BLOCKED_URL_US           = "https://k1monfared.github.io/mortgage_rate_tracker/blocked/"
+ERROR_URL_US             = "https://k1monfared.github.io/mortgage_rate_tracker/us/?err=1"
+
+# Base fallbacks (used when no _CA/_US-specific variant exists).
+CONFIRMATION_SENT_URL = "https://k1monfared.github.io/mortgage_rate_tracker/confirmation-sent/"
+BLOCKED_URL           = "https://k1monfared.github.io/mortgage_rate_tracker/blocked/"
+ERROR_URL             = "https://k1monfared.github.io/mortgage_rate_tracker/?err=1"
+
+# AUDIENCE_ID_CA and AUDIENCE_ID_US are NOT set here. Use:
+#   wrangler secret put AUDIENCE_ID_CA
+#   wrangler secret put AUDIENCE_ID_US
+# Keeping audience UUIDs as secrets makes the Worker config portable and
+# prevents leaking them in public repos.
+
+# KV namespace for pending confirmation tokens, rate-limit, and block keys.
+# Create one with: npx wrangler kv namespace create SUBSCRIBE_KV
+# Then replace the placeholder id below with the printed one.
+[[kv_namespaces]]
+binding = "SUBSCRIBE_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# D1 database for the audit log (every subscribe / confirm / block attempt).
+# Create one with: npx wrangler d1 create mortgage-subscribe-audit
+# Apply schema:   npx wrangler d1 execute mortgage-subscribe-audit --remote --file=./schema.sql
+# Then replace the placeholder database_id below with the printed one.
+[[d1_databases]]
+binding = "AUDIT_DB"
+database_name = "mortgage-subscribe-audit"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"

@@ -1,0 +1,15 @@
+{
+  "name": "mortgage-rates-subscribe-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker that proxies subscribe form submissions to Resend for the mortgage rate tracker (CA + US).",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "typescript": "^5.4.0",
+    "wrangler": "^4.84.0"
+  }
+}

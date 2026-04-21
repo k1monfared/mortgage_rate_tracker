@@ -24,6 +24,24 @@ jobs:
         run: pip install -r requirements_boc.txt
       - name: Build site
         run: python build_site.py
+      - name: Send rate-change emails
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          AUDIENCE_ID_CA: ${{ secrets.AUDIENCE_ID_CA }}
+          AUDIENCE_ID_US: ${{ secrets.AUDIENCE_ID_US }}
+          FROM_ADDR: ${{ vars.FROM_ADDR }}
+          SENDER_BASE_URL: https://k1monfared.github.io/mortgage_rate_tracker
+        run: python send_rate_emails.py
+      - name: Commit rate_changes.json on detected change
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/rate_changes.json 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: record rate change [skip ci]"
+            git push
+          fi
       - name: Keep-alive commit (weekly, Mondays UTC)
         if: github.event_name == 'schedule'
         run: |
@@ -34,7 +52,8 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add data/last_run.txt \
                     data/boc_policy_rate.csv data/commercial_prime_rate.csv data/metadata.json \
-                    data/us_fed_funds_rate.csv data/us_prime_rate.csv data/us_metadata.json 2>/dev/null || true
+                    data/us_fed_funds_rate.csv data/us_prime_rate.csv data/us_metadata.json \
+                    data/rate_changes.json 2>/dev/null || true
             if ! git diff --cached --quiet; then
               git commit -m "chore: keep-alive $(cat data/last_run.txt) [skip ci]"
               git push
