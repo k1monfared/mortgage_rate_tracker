@@ -1,0 +1,46 @@
+{
+  "regions": [
+    {
+      "id": "volcker_disinflation",
+      "label": "Volcker Disinflation",
+      "start": "1979-10-06",
+      "end": "1982-10-01",
+      "color": "rgba(255, 160, 100, 0.18)"
+    },
+    {
+      "id": "recession_1990",
+      "label": "1990–91 Recession",
+      "start": "1990-07-01",
+      "end": "1991-03-01",
+      "color": "rgba(180, 140, 220, 0.20)"
+    },
+    {
+      "id": "dotcom_bust",
+      "label": "Dot-com Bust",
+      "start": "2000-03-01",
+      "end": "2002-10-01",
+      "color": "rgba(140, 180, 255, 0.20)"
+    },
+    {
+      "id": "financial_crisis_2008",
+      "label": "2008 Financial Crisis",
+      "start": "2008-09-01",
+      "end": "2009-06-01",
+      "color": "rgba(255, 130, 130, 0.22)"
+    },
+    {
+      "id": "covid_pandemic",
+      "label": "COVID-19 Pandemic",
+      "start": "2020-02-01",
+      "end": "2021-09-01",
+      "color": "rgba(255, 200, 80, 0.22)"
+    },
+    {
+      "id": "fed_hike_cycle",
+      "label": "Post-pandemic Fed Hikes",
+      "start": "2022-03-16",
+      "end": "2023-07-26",
+      "color": "rgba(100, 200, 160, 0.22)"
+    }
+  ]
+}

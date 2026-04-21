@@ -1,16 +1,23 @@
 """
 Build script for GitHub Pages site.
 
-Data strategy:
-  - data/boc_policy_rate.csv and data/commercial_prime_rate.csv are committed to the repo
-    with full historical data.  On each build, only new records since the last stored date
-    are fetched from the BoC API (incremental update).
-  - data/events.json is manually maintained and committed.
+Builds per-region pages for Canada (BoC) and the United States (FRED), plus a
+small landing page at site/index.html. Data strategy:
 
-Outputs:
-  - site/data/rates.json   — policy + prime arrays, current-value meta
-  - site/data/events.json  — copy of data/events.json
-  - site/index.html        — ECharts-based interactive page
+  - CA: data/boc_policy_rate.csv, data/commercial_prime_rate.csv (BoC Valet API)
+  - US: data/us_fed_funds_rate.csv, data/us_prime_rate.csv (FRED fredgraph CSV)
+  - Each region has its own events file: data/events.json, data/us_events.json.
+
+On each build, only new records since the last stored date are fetched
+(incremental update). Output:
+
+  - site/index.html                  — landing page
+  - site/ca/index.html               — Canadian tracker
+  - site/ca/data/rates.json          — CA rates payload
+  - site/ca/data/events.json         — CA events (copy)
+  - site/us/index.html               — US tracker
+  - site/us/data/rates.json          — US rates payload
+  - site/us/data/events.json         — US events (copy)
 """
 
 import json
@@ -18,25 +25,23 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
+from fred_rates import FREDRateFetcher
 from historical_rates import HistoricalRateFetcher
 
 
 # ---------------------------------------------------------------------------
-# HTML template — uses __BUILD_TIME__ as the only Python-side substitution.
-# All other dynamic content (rates, events) is loaded at runtime via fetch().
+# Region page template — uses __TOKEN__ placeholders for per-region strings.
 # ---------------------------------------------------------------------------
-HTML_TEMPLATE = r"""<!DOCTYPE html>
+REGION_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Canadian Interest Rate Tracker</title>
+  <title>__TITLE__</title>
   <link rel="stylesheet" href="https://k1monfared.github.io/site_kit/css/base.css">
   <script src="https://k1monfared.github.io/site_kit/js/theme.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
   <style>
-    /* Page-specific palette, layered on top of site_kit's base palette.
-       Dark defaults live on :root; light overrides live under [data-theme="light"]. */
     :root {
       --card-bg: #16213e;
       --card-border: #30363d;
@@ -121,6 +126,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     #theme-toggle:hover { background: var(--btn-hover-bg); border-color: var(--muted); }
 
+    .region-nav {
+      position: fixed; top: 16px; right: 60px;
+      display: flex; gap: 8px; z-index: 100;
+    }
+    .flag-link {
+      display: block; line-height: 0;
+      border-radius: 3px; overflow: hidden;
+      border: 1px solid var(--card-border);
+      box-shadow: 0 1px 3px rgba(0,0,0,.25);
+      transition: opacity .15s, transform .15s, border-color .15s;
+    }
+    .flag-link img { width: 36px; height: auto; display: block; }
+    .flag-link.active { opacity: .45; pointer-events: none; cursor: default; }
+    .flag-link:not(.active):hover { transform: translateY(-1px); border-color: var(--muted); }
+
     @media (max-width: 640px) {
       body { padding: 12px 10px; }
       h1 { font-size: 1.25rem; margin-bottom: 14px; padding-right: 44px; }
@@ -130,22 +150,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       .btn { font-size: 13px; padding: 9px 14px; }
       #chart { height: 360px; }
       #theme-toggle { top: 8px; right: 8px; width: 32px; height: 32px; font-size: 14px; }
+      .region-nav { top: 12px; right: 48px; gap: 4px; }
+      .flag-link img { width: 28px; }
     }
   </style>
 </head>
 <body>
+  <nav class="region-nav" aria-label="Region">
+    <a href="../ca/" class="flag-link __CA_ACTIVE__" aria-label="Canada" title="Canadian rates"><img src="https://flagcdn.com/ca.svg" alt="CA" width="36"></a>
+    <a href="../us/" class="flag-link __US_ACTIVE__" aria-label="United States" title="US rates"><img src="https://flagcdn.com/us.svg" alt="US" width="36"></a>
+  </nav>
   <button id="theme-toggle" aria-label="Toggle theme"><span class="theme-icon"></span></button>
 
-  <h1>Canadian Interest Rate Tracker</h1>
+  <h1>__TITLE__</h1>
 
   <div class="stats">
     <div class="stat-box">
-      <div class="label">BoC Policy Rate</div>
+      <div class="label">__LABEL_POLICY__</div>
       <div class="value" id="policyRate">–</div>
       <div class="as-of" id="policyDate"></div>
     </div>
     <div class="stat-box">
-      <div class="label">Commercial Prime Rate</div>
+      <div class="label">__LABEL_PRIME__</div>
       <div class="value" id="primeRate">–</div>
       <div class="as-of" id="primeDate"></div>
     </div>
@@ -165,17 +191,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <p id="error">Failed to load chart data. Please try refreshing.</p>
 
   <div class="description">
-    <p>The <strong>BoC Policy Rate</strong> is the overnight interest rate target set by the
-    Bank of Canada at up to eight scheduled announcements per year; it directly steers
-    borrowing costs across the economy. The <strong>Commercial Prime Rate</strong> is the
-    benchmark lending rate used by major Canadian banks, historically running about
-    2–2.5 percentage points above the Policy Rate. Hover over the chart to read exact
-    values for any date. Zoom in to under three years to see individual announcement
-    dots on the line.</p>
+    <p>The <strong>__LABEL_POLICY__</strong> is the short-term benchmark rate
+    set by the central bank; it steers borrowing costs across the economy.
+    The <strong>__LABEL_PRIME__</strong> is the benchmark lending rate used
+    by major commercial banks, historically running a few percentage points
+    above the policy rate. Hover over the chart to read exact values for any
+    date. Zoom in to under three years to see individual announcement dots
+    on the line.</p>
   </div>
 
   <div class="footer">
-    Data source: <a href="https://www.bankofcanada.ca/valet/docs" target="_blank" rel="external noopener">Bank of Canada Valet API</a>
+    Data source: <a href="__SOURCE_URL__" target="_blank" rel="external noopener">__SOURCE_NAME__</a>
     &mdash; Built __BUILD_TIME__
     &mdash; <a href="https://github.com/k1monfared/mortgage_rate_tracker" target="_blank" rel="external noopener">GitHub</a>
     &mdash; <a href="https://k1monfared.github.io/sponsor.html" rel="external noopener">Sponsor</a>
@@ -186,9 +212,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   var rates, events, chart, eventsVisible = false, dotsVisible = false;
   var THREE_YEARS_MS = 3 * 365.25 * 24 * 3600 * 1000;
 
-  // ── BoC series codes ───────────────────────────────────────────────────
-  var BOC_POLICY = 'V122530';
-  var BOC_PRIME  = 'V80691311';
+  // ── Region / data-source config (substituted by build_site.py) ─────────
+  var SLUG         = '__SLUG__';
+  var REFRESH_API  = '__REFRESH_API__';   // 'boc' or 'fred'
+  var SERIES_POLICY = '__SERIES_POLICY__';
+  var SERIES_PRIME  = '__SERIES_PRIME__';
+  var LABEL_POLICY  = '__LABEL_POLICY__';
+  var LABEL_PRIME   = '__LABEL_PRIME__';
+  var STATE_KEY    = 'tracker.state.' + SLUG;
 
   // ── Theme palette (reads live CSS variables so it tracks the toggle) ───
   function chartPalette() {
@@ -292,8 +323,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   var emptyMarkArea = { data: [] };
 
-  // Binary search: last entry in sorted series whose date <= ts (ms).
-  // Returns the rate value, or null if ts is before all data.
   function findStepRate(series, ts) {
     var lo = 0, hi = series.length - 1, result = null;
     while (lo <= hi) {
@@ -314,10 +343,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     var qRate = findStepRate(rates.prime,  ts);
     var html  = '<strong>' + date + '</strong><br>';
     if (pRate !== null)
-      html += '<span style="color:' + p.policy + '">&#9679;</span> BoC Policy Rate: <strong>'
+      html += '<span style="color:' + p.policy + '">&#9679;</span> ' + LABEL_POLICY + ': <strong>'
             + pRate.toFixed(2) + '%</strong><br>';
     if (qRate !== null)
-      html += '<span style="color:' + p.prime + '">&#9679;</span> Commercial Prime Rate: <strong>'
+      html += '<span style="color:' + p.prime + '">&#9679;</span> ' + LABEL_PRIME + ': <strong>'
             + qRate.toFixed(2) + '%</strong><br>';
     return html;
   }
@@ -340,7 +369,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     });
   }
 
-  // ── Fetch new records from BoC JSON API ────────────────────────────────
+  // ── Fetch new records: BoC JSON or FRED CSV ─────────────────────────────
   function fetchBoCJson(series, startDate, endDate) {
     var url = 'https://www.bankofcanada.ca/valet/observations/'
               + series + '/json?start_date=' + startDate + '&end_date=' + endDate;
@@ -358,6 +387,34 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       });
   }
 
+  function fetchFREDCsv(series, startDate, endDate) {
+    var url = 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=' + series
+              + '&cosd=' + startDate + '&coed=' + endDate;
+    return fetch(url)
+      .then(function(r) {
+        if (!r.ok) throw new Error('FRED returned ' + r.status);
+        return r.text();
+      })
+      .then(function(text) {
+        var lines = text.trim().split('\n');
+        var out = [];
+        for (var i = 1; i < lines.length; i++) {
+          var parts = lines[i].split(',');
+          if (parts.length < 2) continue;
+          var v = parseFloat(parts[1]);
+          if (isNaN(v)) continue;   // skips "." missing-value rows
+          out.push({ date: parts[0], rate: v });
+        }
+        return out;
+      });
+  }
+
+  function fetchSeriesRange(series, startDate, endDate) {
+    return REFRESH_API === 'fred'
+      ? fetchFREDCsv(series, startDate, endDate)
+      : fetchBoCJson(series, startDate, endDate);
+  }
+
   // ── Refresh button handler ─────────────────────────────────────────────
   function refreshData() {
     var btn    = document.getElementById('refreshBtn');
@@ -371,8 +428,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     var end = today();
 
     Promise.all([
-      fetchBoCJson(BOC_POLICY, policyStart, end),
-      fetchBoCJson(BOC_PRIME,  primeStart,  end),
+      fetchSeriesRange(SERIES_POLICY, policyStart, end),
+      fetchSeriesRange(SERIES_PRIME,  primeStart,  end),
     ])
     .then(function(results) {
       var newPolicy = results[0];
@@ -412,6 +469,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     });
   }
 
+  // ── Per-region state persistence ───────────────────────────────────────
+  function loadState() {
+    try {
+      var raw = localStorage.getItem(STATE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      localStorage.removeItem(STATE_KEY);
+      return null;
+    }
+  }
+  var saveStateTimer = null;
+  function saveState(patch) {
+    clearTimeout(saveStateTimer);
+    saveStateTimer = setTimeout(function() {
+      var current = loadState() || {};
+      for (var k in patch) current[k] = patch[k];
+      try { localStorage.setItem(STATE_KEY, JSON.stringify(current)); } catch (e) {}
+    }, 250);
+  }
+
   // ── Init ───────────────────────────────────────────────────────────────
   (async function init() {
     try {
@@ -436,7 +513,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       return d.toISOString().slice(0, 10);
     })();
 
-    // markPoint config: no symbol, text label above (max) / below (min), card bg to avoid overlap
     function makeMarkPoint(color) {
       var p = chartPalette();
       var labelBase = {
@@ -482,7 +558,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         formatter: tooltipFormatter,
       },
       legend: {
-        data: ['BoC Policy Rate', 'Commercial Prime Rate'],
+        data: [LABEL_POLICY, LABEL_PRIME],
         top: 8, itemGap: 24,
         textStyle: { color: pal.text },
       },
@@ -531,7 +607,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       ],
       series: [
         {
-          name: 'BoC Policy Rate',
+          name: LABEL_POLICY,
           type: 'line', step: 'end',
           data: rates.policy.map(function(d) { return [d.date, d.rate]; }),
           lineStyle: { color: pal.policy, width: 2 },
@@ -541,7 +617,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           markArea: emptyMarkArea,
         },
         {
-          name: 'Commercial Prime Rate',
+          name: LABEL_PRIME,
           type: 'line', step: 'end',
           data: rates.prime.map(function(d) { return [d.date, d.rate]; }),
           lineStyle: { color: pal.prime, width: 2 },
@@ -554,16 +630,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     });
 
     // Events toggle
-    document.getElementById('toggleEvents').addEventListener('click', function() {
-      eventsVisible = !eventsVisible;
+    function setEventsVisible(v) {
+      eventsVisible = v;
       chart.setOption({
         series: [
           { markArea: eventsVisible ? buildMarkArea() : emptyMarkArea },
           { markArea: emptyMarkArea },
         ],
       });
-      this.textContent = eventsVisible ? 'Hide Historical Events' : 'Show Historical Events';
-      this.classList.toggle('active', eventsVisible);
+      var btn = document.getElementById('toggleEvents');
+      btn.textContent = eventsVisible ? 'Hide Historical Events' : 'Show Historical Events';
+      btn.classList.toggle('active', eventsVisible);
+      saveState({ eventsVisible: eventsVisible });
+    }
+    document.getElementById('toggleEvents').addEventListener('click', function() {
+      setEventsVisible(!eventsVisible);
     });
 
     // Refresh button
@@ -604,6 +685,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       var start = toMs(dz.startValue, 0);
       var end   = toMs(dz.endValue,   Date.now());
       applyDotsForRange(end - start);
+      saveState({ zoomStartMs: start, zoomEndMs: end });
     }
     chart.on('datazoom', updateDots);
 
@@ -611,20 +693,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     // window (defaultStart → today) directly to set dot visibility.
     applyDotsForRange(Date.now() - toMs(defaultStart, 0));
 
+    // Restore saved per-region state, if any.
+    var saved = loadState();
+    if (saved) {
+      if (typeof saved.zoomStartMs === 'number' && typeof saved.zoomEndMs === 'number'
+          && saved.zoomEndMs > saved.zoomStartMs) {
+        chart.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0,
+                               startValue: saved.zoomStartMs, endValue: saved.zoomEndMs });
+        chart.dispatchAction({ type: 'dataZoom', dataZoomIndex: 1,
+                               startValue: saved.zoomStartMs, endValue: saved.zoomEndMs });
+        applyDotsForRange(saved.zoomEndMs - saved.zoomStartMs);
+      }
+      if (saved.eventsVisible === true) {
+        setEventsVisible(true);
+      }
+    }
+
     // Theme recolor: merge-apply a palette-derived option when data-theme flips.
-    // setOption(..., false) merges rather than replaces, so zoom state is preserved.
     function applyThemeToChart() {
       if (!chart) return;
       var p = chartPalette();
       chart.setOption(themedOption(p), false);
-      // markPoint labels capture colors at construction time, so rebuild them.
       chart.setOption({
         series: [
           { markPoint: makeMarkPoint(p.policy) },
           { markPoint: makeMarkPoint(p.prime) },
         ],
       }, false);
-      // If historical events are currently shown, rebuild their label color too.
       if (eventsVisible) {
         chart.setOption({
           series: [ { markArea: buildMarkArea() }, { markArea: emptyMarkArea } ],
@@ -636,7 +731,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       { attributes: true, attributeFilter: ['data-theme'] }
     );
 
-    // Responsive
     window.addEventListener('resize', function() { chart.resize(); });
   })();
   </script>
@@ -645,36 +739,232 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 """
 
 
-def build_site():
-    site_dir = Path("site")
-    data_out = site_dir / "data"
-    site_dir.mkdir(exist_ok=True)
-    data_out.mkdir(exist_ok=True)
+# ---------------------------------------------------------------------------
+# Landing page template — tiny two-card grid, reuses site_kit palette.
+# ---------------------------------------------------------------------------
+LANDING_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Interest Rate Tracker</title>
+  <link rel="stylesheet" href="https://k1monfared.github.io/site_kit/css/base.css">
+  <script src="https://k1monfared.github.io/site_kit/js/theme.js"></script>
+  <style>
+    :root {
+      --card-bg: #16213e;
+      --card-border: #30363d;
+      --muted: #8b949e;
+      --btn-hover-bg: #1f2a44;
+    }
+    [data-theme="light"] {
+      --card-bg: #ffffff;
+      --card-border: #e1e4e8;
+      --muted: #6a737d;
+      --btn-hover-bg: #f0f0f0;
+    }
 
-    fetcher = HistoricalRateFetcher()
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 40px 20px;
+      background: var(--bg); color: var(--text);
+      transition: background .2s, color .2s;
+      min-height: 100vh;
+      display: flex; flex-direction: column;
+    }
+    h1 { text-align: center; margin: 0 0 8px; font-size: 1.8rem; }
+    .tagline {
+      text-align: center; color: var(--muted); font-size: 14px;
+      max-width: 560px; margin: 0 auto 32px;
+    }
+    .cards {
+      display: grid; gap: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      max-width: 780px; width: 100%; margin: 0 auto;
+    }
+    a.card, a.card:link, a.card:visited, a.card:hover, a.card:focus, a.card:active {
+      color: var(--text);
+      text-decoration: none;
+    }
+    .card {
+      display: block;
+      background: var(--card-bg); border: 1px solid var(--card-border);
+      border-radius: 12px; padding: 24px;
+      transition: transform .15s, border-color .15s, background .15s;
+      box-shadow: 0 1px 4px rgba(0,0,0,.18);
+    }
+    .card:hover {
+      transform: translateY(-2px);
+      border-color: var(--link);
+      background: var(--btn-hover-bg);
+    }
+    .card .region {
+      font-size: 13px; color: var(--muted); text-transform: uppercase;
+      letter-spacing: .6px; margin-bottom: 4px;
+    }
+    .card .headline {
+      font-size: 1.2rem; font-weight: 600; margin-bottom: 16px;
+    }
+    .rate-row {
+      display: flex; justify-content: space-between; align-items: baseline;
+      margin-bottom: 8px;
+    }
+    .rate-row .name { color: var(--muted); font-size: 13px; }
+    .rate-row .val  { font-weight: 700; font-size: 18px; }
+    .rate-row .date { color: var(--muted); font-size: 11px; margin-left: 8px; }
+    .card .cta {
+      margin-top: 12px; color: var(--link); font-size: 13px;
+    }
+    .footer {
+      margin-top: auto; padding-top: 32px;
+      text-align: center; font-size: 11px; color: var(--muted); opacity: .85;
+    }
+    .footer a { color: var(--link); text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
 
-    # Fetch only new records since last stored date (or full history on first run)
-    print("Updating policy rate data...")
-    fetcher.update_incremental("policy")
-    print("Updating prime rate data...")
-    fetcher.update_incremental("prime")
+    #theme-toggle {
+      position: fixed; top: 12px; right: 12px;
+      width: 36px; height: 36px; border-radius: 50%;
+      background: var(--card-bg); border: 1px solid var(--card-border);
+      color: var(--text); cursor: pointer; font-size: 16px; line-height: 1;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 1px 4px rgba(0,0,0,.2); z-index: 100;
+      transition: background .15s, border-color .15s;
+    }
 
-    # Load full data from local CSVs
+    .region-nav {
+      position: fixed; top: 16px; right: 60px;
+      display: flex; gap: 8px; z-index: 100;
+    }
+    .flag-link {
+      display: block; line-height: 0;
+      border-radius: 3px; overflow: hidden;
+      border: 1px solid var(--card-border);
+      box-shadow: 0 1px 3px rgba(0,0,0,.25);
+      transition: transform .15s, border-color .15s;
+    }
+    .flag-link img { width: 36px; height: auto; display: block; }
+    .flag-link:hover { transform: translateY(-1px); border-color: var(--muted); }
+
+    @media (max-width: 640px) {
+      body { padding: 24px 14px; }
+      h1 { font-size: 1.4rem; padding-right: 44px; text-align: left; }
+      .tagline { text-align: left; margin-bottom: 24px; }
+      #theme-toggle { top: 8px; right: 8px; width: 32px; height: 32px; font-size: 14px; }
+      .region-nav { top: 12px; right: 48px; gap: 4px; }
+      .flag-link img { width: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <nav class="region-nav" aria-label="Region">
+    <a href="ca/" class="flag-link" aria-label="Canada" title="Canadian rates"><img src="https://flagcdn.com/ca.svg" alt="CA" width="36"></a>
+    <a href="us/" class="flag-link" aria-label="United States" title="US rates"><img src="https://flagcdn.com/us.svg" alt="US" width="36"></a>
+  </nav>
+  <button id="theme-toggle" aria-label="Toggle theme"><span class="theme-icon"></span></button>
+
+  <h1>Interest Rate Tracker</h1>
+  <p class="tagline">Live charts of central-bank and commercial prime rates. Pick a region.</p>
+
+  <div class="cards">
+    <a class="card" href="ca/">
+      <div class="region">🇨🇦 Canada</div>
+      <div class="headline">Bank of Canada</div>
+      <div class="rate-row">
+        <span class="name">BoC Policy Rate</span>
+        <span><span class="val" id="ca-policy">–</span><span class="date" id="ca-policy-date"></span></span>
+      </div>
+      <div class="rate-row">
+        <span class="name">Commercial Prime</span>
+        <span><span class="val" id="ca-prime">–</span><span class="date" id="ca-prime-date"></span></span>
+      </div>
+      <div class="cta">View chart →</div>
+    </a>
+    <a class="card" href="us/">
+      <div class="region">🇺🇸 United States</div>
+      <div class="headline">Federal Reserve</div>
+      <div class="rate-row">
+        <span class="name">Fed Funds</span>
+        <span><span class="val" id="us-policy">–</span><span class="date" id="us-policy-date"></span></span>
+      </div>
+      <div class="rate-row">
+        <span class="name">US Bank Prime</span>
+        <span><span class="val" id="us-prime">–</span><span class="date" id="us-prime-date"></span></span>
+      </div>
+      <div class="cta">View chart →</div>
+    </a>
+  </div>
+
+  <div class="footer">
+    Built __BUILD_TIME__
+    &mdash; <a href="https://github.com/k1monfared/mortgage_rate_tracker" target="_blank" rel="external noopener">GitHub</a>
+    &mdash; <a href="https://k1monfared.github.io/sponsor.html" rel="external noopener">Sponsor</a>
+  </div>
+
+  <script>
+  function fillCard(slug, data) {
+    var m = data && data.meta;
+    if (!m) return;
+    document.getElementById(slug + '-policy').textContent       = m.policy_current.toFixed(2) + '%';
+    document.getElementById(slug + '-policy-date').textContent  = ' ' + m.policy_current_date;
+    document.getElementById(slug + '-prime').textContent        = m.prime_current.toFixed(2) + '%';
+    document.getElementById(slug + '-prime-date').textContent   = ' ' + m.prime_current_date;
+  }
+  ['ca', 'us'].forEach(function(slug) {
+    fetch(slug + '/data/rates.json')
+      .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function(data) { fillCard(slug, data); })
+      .catch(function(e) { console.warn('Failed to load ' + slug + ' rates:', e); });
+  });
+  </script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Region configuration
+# ---------------------------------------------------------------------------
+REGIONS = [
+    {
+        "slug": "ca",
+        "title": "Canadian Interest Rate Tracker",
+        "fetcher": HistoricalRateFetcher(),
+        "labels": {"policy": "BoC Policy Rate",
+                   "prime":  "Commercial Prime Rate"},
+        "source_name": "Bank of Canada Valet API",
+        "source_url":  "https://www.bankofcanada.ca/valet/docs",
+        "events_file": Path("data/events.json"),
+        "series":      {"policy": "V122530", "prime": "V80691311"},
+        "refresh_api": "boc",
+    },
+    {
+        "slug": "us",
+        "title": "US Interest Rate Tracker",
+        "fetcher": FREDRateFetcher(),
+        "labels": {"policy": "Fed Funds Rate",
+                   "prime":  "US Bank Prime Rate"},
+        "source_name": "Federal Reserve Economic Data (FRED)",
+        "source_url":  "https://fred.stlouisfed.org/",
+        "events_file": Path("data/us_events.json"),
+        "series":      {"policy": "DFF", "prime": "DPRIME"},
+        "refresh_api": "fred",
+    },
+]
+
+
+def write_rates_json(cfg, out_path, build_time):
+    """Serialize a region's rates + metadata to JSON."""
+    fetcher  = cfg["fetcher"]
     policy_df = fetcher.load_rate_data("policy")
-    prime_df = fetcher.load_rate_data("prime")
-
-    if policy_df is None or prime_df is None:
-        raise RuntimeError("Failed to load rate data from local CSV files")
-
-    policy_df = policy_df.sort_values("date")
-    prime_df = prime_df.sort_values("date")
+    prime_df  = fetcher.load_rate_data("prime")
+    if policy_df is None or prime_df is None or policy_df.empty or prime_df.empty:
+        raise RuntimeError(f"Missing data for region {cfg['slug']}")
 
     latest_policy = policy_df.iloc[-1]
-    latest_prime = prime_df.iloc[-1]
-    build_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    latest_prime  = prime_df.iloc[-1]
 
-    # Write site/data/rates.json
-    rates_data = {
+    payload = {
         "policy": [
             {"date": row["date"].strftime("%Y-%m-%d"), "rate": float(row["rate"])}
             for _, row in policy_df.iterrows()
@@ -684,31 +974,80 @@ def build_site():
             for _, row in prime_df.iterrows()
         ],
         "meta": {
-            "policy_current": float(latest_policy["rate"]),
+            "policy_current":      float(latest_policy["rate"]),
             "policy_current_date": latest_policy["date"].strftime("%Y-%m-%d"),
-            "prime_current": float(latest_prime["rate"]),
-            "prime_current_date": latest_prime["date"].strftime("%Y-%m-%d"),
+            "prime_current":       float(latest_prime["rate"]),
+            "prime_current_date":  latest_prime["date"].strftime("%Y-%m-%d"),
             "built": build_time,
+            "labels": cfg["labels"],
         },
     }
-    with open(data_out / "rates.json", "w") as f:
-        json.dump(rates_data, f, separators=(",", ":"))
-    print(f"Wrote site/data/rates.json ({len(rates_data['policy'])} policy, {len(rates_data['prime'])} prime records)")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(payload, f, separators=(",", ":"))
+    print(f"Wrote {out_path} ({len(payload['policy'])} policy, {len(payload['prime'])} prime records)")
 
-    # Copy events.json
-    events_src = Path("data") / "events.json"
-    if events_src.exists():
-        shutil.copy(events_src, data_out / "events.json")
-        print("Copied data/events.json → site/data/events.json")
-    else:
-        print("WARNING: data/events.json not found — writing empty events file")
-        with open(data_out / "events.json", "w") as f:
-            json.dump({"regions": []}, f)
 
-    # Write site/index.html
-    html = HTML_TEMPLATE.replace("__BUILD_TIME__", build_time)
-    (site_dir / "index.html").write_text(html, encoding="utf-8")
-    print("Site built successfully: site/index.html")
+def render_region(cfg, build_time):
+    slug = cfg["slug"]
+    substitutions = {
+        "__TITLE__":          cfg["title"],
+        "__LABEL_POLICY__":   cfg["labels"]["policy"],
+        "__LABEL_PRIME__":    cfg["labels"]["prime"],
+        "__SOURCE_NAME__":    cfg["source_name"],
+        "__SOURCE_URL__":     cfg["source_url"],
+        "__SERIES_POLICY__":  cfg["series"]["policy"],
+        "__SERIES_PRIME__":   cfg["series"]["prime"],
+        "__SLUG__":           slug,
+        "__REFRESH_API__":    cfg["refresh_api"],
+        "__CA_ACTIVE__":      "active" if slug == "ca" else "",
+        "__US_ACTIVE__":      "active" if slug == "us" else "",
+        "__BUILD_TIME__":     build_time,
+    }
+    html = REGION_TEMPLATE
+    for token, value in substitutions.items():
+        html = html.replace(token, value)
+    return html
+
+
+def render_landing(build_time):
+    return LANDING_TEMPLATE.replace("__BUILD_TIME__", build_time)
+
+
+def build_site():
+    site_dir = Path("site")
+    site_dir.mkdir(exist_ok=True)
+    build_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    for cfg in REGIONS:
+        slug = cfg["slug"]
+        print(f"\n{'=' * 70}\nBuilding region: {slug}\n{'=' * 70}")
+        fetcher = cfg["fetcher"]
+        fetcher.update_incremental("policy")
+        fetcher.update_incremental("prime")
+
+        out_dir = site_dir / slug
+        out_dir.mkdir(parents=True, exist_ok=True)
+        data_out = out_dir / "data"
+        data_out.mkdir(exist_ok=True)
+
+        write_rates_json(cfg, data_out / "rates.json", build_time)
+
+        events_src = cfg["events_file"]
+        if events_src.exists():
+            shutil.copy(events_src, data_out / "events.json")
+            print(f"Copied {events_src} → {data_out / 'events.json'}")
+        else:
+            print(f"WARNING: {events_src} not found — writing empty events file")
+            with open(data_out / "events.json", "w") as f:
+                json.dump({"regions": []}, f)
+
+        html = render_region(cfg, build_time)
+        (out_dir / "index.html").write_text(html, encoding="utf-8")
+        print(f"Built {out_dir / 'index.html'}")
+
+    (site_dir / "index.html").write_text(render_landing(build_time), encoding="utf-8")
+    print(f"Built landing page: {site_dir / 'index.html'}")
 
 
 if __name__ == "__main__":

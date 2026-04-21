@@ -32,7 +32,9 @@ jobs:
             date -u +"%Y-%m-%dT%H:%M:%SZ" > data/last_run.txt
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add data/last_run.txt
+            git add data/last_run.txt \
+                    data/boc_policy_rate.csv data/commercial_prime_rate.csv data/metadata.json \
+                    data/us_fed_funds_rate.csv data/us_prime_rate.csv data/us_metadata.json 2>/dev/null || true
             if ! git diff --cached --quiet; then
               git commit -m "chore: keep-alive $(cat data/last_run.txt) [skip ci]"
               git push
