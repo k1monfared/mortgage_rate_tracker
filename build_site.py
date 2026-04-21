@@ -26,73 +26,116 @@ from historical_rates import HistoricalRateFetcher
 # All other dynamic content (rates, events) is loaded at runtime via fetch().
 # ---------------------------------------------------------------------------
 HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Canadian Interest Rate Tracker</title>
+  <link rel="stylesheet" href="https://k1monfared.github.io/site_kit/css/base.css">
+  <script src="https://k1monfared.github.io/site_kit/js/theme.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
   <style>
+    /* Page-specific palette, layered on top of site_kit's base palette.
+       Dark defaults live on :root; light overrides live under [data-theme="light"]. */
+    :root {
+      --card-bg: #16213e;
+      --card-border: #30363d;
+      --muted: #8b949e;
+      --accent-policy: #58a6ff;
+      --accent-prime:  #d2a8ff;
+      --chart-axis: #8b949e;
+      --chart-grid: #30363d;
+      --tooltip-bg: #16213e;
+      --btn-hover-bg: #1f2a44;
+    }
+    [data-theme="light"] {
+      --card-bg: #ffffff;
+      --card-border: #e1e4e8;
+      --muted: #6a737d;
+      --accent-policy: #2E86AB;
+      --accent-prime:  #A23B72;
+      --chart-axis: #6a737d;
+      --chart-grid: #e1e4e8;
+      --tooltip-bg: #ffffff;
+      --btn-hover-bg: #f0f0f0;
+    }
+
     *, *::before, *::after { box-sizing: border-box; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       margin: 0; padding: 20px;
-      background: #f5f6fa; color: #333;
+      background: var(--bg); color: var(--text);
+      transition: background .2s, color .2s;
     }
-    h1 { text-align: center; color: #1a1a2e; margin: 0 0 20px; font-size: 1.6rem; }
+    h1 { text-align: center; color: var(--text); margin: 0 0 20px; font-size: 1.6rem; }
     .stats {
       display: flex; gap: 14px; justify-content: center;
       margin-bottom: 16px; flex-wrap: wrap;
     }
     .stat-box {
-      background: #fff; border: 1px solid #e0e0e0; border-radius: 10px;
+      background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px;
       padding: 14px 28px; text-align: center; min-width: 160px; flex: 1 1 160px; max-width: 260px;
-      box-shadow: 0 1px 4px rgba(0,0,0,.06);
+      box-shadow: 0 1px 4px rgba(0,0,0,.18);
     }
-    .stat-box .label { font-size: 12px; color: #777; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
-    .stat-box .value { font-size: 30px; font-weight: 700; color: #1a1a2e; }
-    .stat-box .as-of { font-size: 11px; color: #aaa; margin-top: 3px; }
+    .stat-box .label { font-size: 12px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
+    .stat-box .value { font-size: 30px; font-weight: 700; color: var(--text); }
+    .stat-box .as-of { font-size: 11px; color: var(--muted); margin-top: 3px; opacity: .75; }
     .controls {
       display: flex; gap: 8px; justify-content: center; align-items: center;
       flex-wrap: wrap; margin-bottom: 12px;
     }
     .btn {
-      padding: 9px 18px; border: 1px solid #ccc; border-radius: 6px;
-      background: #fff; cursor: pointer; font-size: 14px; color: #444;
+      padding: 9px 18px; border: 1px solid var(--card-border); border-radius: 6px;
+      background: var(--card-bg); cursor: pointer; font-size: 14px; color: var(--text);
       min-height: 42px; touch-action: manipulation;
-      transition: background .15s, border-color .15s;
+      transition: background .15s, border-color .15s, color .15s;
     }
-    .btn:hover { background: #f0f0f0; border-color: #aaa; }
-    .btn.active { background: #1a1a2e; color: #fff; border-color: #1a1a2e; }
+    .btn:hover { background: var(--btn-hover-bg); border-color: var(--muted); }
+    .btn.active { background: var(--link); color: var(--bg); border-color: var(--link); }
     .btn:disabled { opacity: .55; cursor: default; }
-    #refreshStatus { font-size: 12px; color: #777; }
+    #refreshStatus { font-size: 12px; color: var(--muted); }
     .chart-wrap {
-      background: #fff; border: 1px solid #e0e0e0; border-radius: 10px;
-      padding: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.06);
+      background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px;
+      padding: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.18);
     }
     #chart { width: 100%; height: 560px; }
     .footer {
-      text-align: center; font-size: 11px; color: #bbb; margin-top: 14px;
+      text-align: center; font-size: 11px; color: var(--muted); margin-top: 14px; opacity: .85;
     }
-    #error { color: #c00; text-align: center; padding: 20px; display: none; }
+    .footer a { color: var(--link); text-decoration: none; }
+    .footer a:hover { color: var(--link-hover); text-decoration: underline; }
+    #error { color: #e5534b; text-align: center; padding: 20px; display: none; }
     .description {
       max-width: 780px; margin: 14px auto 0; padding: 0 4px;
-      font-size: 13px; line-height: 1.6; color: #666; text-align: left;
+      font-size: 13px; line-height: 1.6; color: var(--muted); text-align: left;
     }
-    .description strong { color: #444; }
+    .description strong { color: var(--text); }
+
+    #theme-toggle {
+      position: fixed; top: 12px; right: 12px;
+      width: 36px; height: 36px; border-radius: 50%;
+      background: var(--card-bg); border: 1px solid var(--card-border);
+      color: var(--text); cursor: pointer; font-size: 16px; line-height: 1;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 1px 4px rgba(0,0,0,.2); z-index: 100;
+      transition: background .15s, border-color .15s;
+    }
+    #theme-toggle:hover { background: var(--btn-hover-bg); border-color: var(--muted); }
 
     @media (max-width: 640px) {
       body { padding: 12px 10px; }
-      h1 { font-size: 1.25rem; margin-bottom: 14px; }
+      h1 { font-size: 1.25rem; margin-bottom: 14px; padding-right: 44px; }
       .stats { gap: 10px; }
       .stat-box { padding: 10px 14px; min-width: 130px; }
       .stat-box .value { font-size: 24px; }
       .btn { font-size: 13px; padding: 9px 14px; }
       #chart { height: 360px; }
+      #theme-toggle { top: 8px; right: 8px; width: 32px; height: 32px; font-size: 14px; }
     }
   </style>
 </head>
 <body>
+  <button id="theme-toggle" aria-label="Toggle theme"><span class="theme-icon"></span></button>
+
   <h1>Canadian Interest Rate Tracker</h1>
 
   <div class="stats">
@@ -132,8 +175,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="footer">
-    Data source: <a href="https://www.bankofcanada.ca/valet/docs" target="_blank">Bank of Canada Valet API</a>
+    Data source: <a href="https://www.bankofcanada.ca/valet/docs" target="_blank" rel="external noopener">Bank of Canada Valet API</a>
     &mdash; Built __BUILD_TIME__
+    &mdash; <a href="https://k1monfared.github.io/sponsor.html" rel="external noopener">Sponsor</a>
   </div>
 
   <script>
@@ -144,6 +188,69 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   // ── BoC series codes ───────────────────────────────────────────────────
   var BOC_POLICY = 'V122530';
   var BOC_PRIME  = 'V80691311';
+
+  // ── Theme palette (reads live CSS variables so it tracks the toggle) ───
+  function chartPalette() {
+    var cs = getComputedStyle(document.documentElement);
+    function v(name, fallback) {
+      var x = cs.getPropertyValue(name);
+      return (x && x.trim()) || fallback;
+    }
+    return {
+      bg:       v('--card-bg',        '#16213e'),
+      text:     v('--text',           '#e0e0e0'),
+      muted:    v('--muted',          '#8b949e'),
+      axis:     v('--chart-axis',     '#8b949e'),
+      grid:     v('--chart-grid',     '#30363d'),
+      tooltip:  v('--tooltip-bg',     '#16213e'),
+      border:   v('--card-border',    '#30363d'),
+      link:     v('--link',           '#58a6ff'),
+      policy:   v('--accent-policy',  '#58a6ff'),
+      prime:    v('--accent-prime',   '#d2a8ff'),
+    };
+  }
+
+  function themedOption(p) {
+    return {
+      backgroundColor: 'transparent',
+      textStyle: { color: p.text },
+      tooltip: {
+        backgroundColor: p.tooltip,
+        borderColor: p.border,
+        textStyle: { color: p.text },
+        axisPointer: { crossStyle: { color: p.muted } },
+      },
+      legend: { textStyle: { color: p.text } },
+      xAxis: {
+        axisLine:  { lineStyle: { color: p.axis } },
+        axisTick:  { lineStyle: { color: p.axis } },
+        axisLabel: { color: p.text },
+      },
+      yAxis: {
+        axisLine:  { lineStyle: { color: p.axis } },
+        axisTick:  { lineStyle: { color: p.axis } },
+        axisLabel: { color: p.text },
+        splitLine: { lineStyle: { color: p.grid } },
+      },
+      dataZoom: [
+        {},
+        { borderColor: p.border, fillerColor: 'rgba(128,128,128,0.12)',
+          handleStyle: { color: p.link }, textStyle: { color: p.muted } },
+      ],
+      series: [
+        {
+          lineStyle: { color: p.policy },
+          itemStyle: { color: p.policy },
+          markPoint: { label: { color: p.policy, backgroundColor: p.bg, borderColor: p.border } },
+        },
+        {
+          lineStyle: { color: p.prime },
+          itemStyle: { color: p.prime },
+          markPoint: { label: { color: p.prime, backgroundColor: p.bg, borderColor: p.border } },
+        },
+      ],
+    };
+  }
 
   // ── Helpers ────────────────────────────────────────────────────────────
   function nextDay(dateStr) {
@@ -166,11 +273,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   function buildMarkArea() {
+    var p = chartPalette();
     return {
       silent: true,
       label: {
         show: true, position: 'insideTop', distance: 6,
-        fontSize: 10, color: '#555', rotate: 90, overflow: 'truncate',
+        fontSize: 10, color: p.text, rotate: 90, overflow: 'truncate',
       },
       data: events.regions.map(function(r) {
         return [
@@ -198,16 +306,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   function tooltipFormatter(params) {
     if (!params || !params.length) return '';
+    var p = chartPalette();
     var ts   = params[0].axisValue;
     var date = new Date(ts).toISOString().slice(0, 10);
     var pRate = findStepRate(rates.policy, ts);
     var qRate = findStepRate(rates.prime,  ts);
     var html  = '<strong>' + date + '</strong><br>';
     if (pRate !== null)
-      html += '<span style="color:#2E86AB">&#9679;</span> BoC Policy Rate: <strong>'
+      html += '<span style="color:' + p.policy + '">&#9679;</span> BoC Policy Rate: <strong>'
             + pRate.toFixed(2) + '%</strong><br>';
     if (qRate !== null)
-      html += '<span style="color:#A23B72">&#9679;</span> Commercial Prime Rate: <strong>'
+      html += '<span style="color:' + p.prime + '">&#9679;</span> Commercial Prime Rate: <strong>'
             + qRate.toFixed(2) + '%</strong><br>';
     return html;
   }
@@ -319,22 +428,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     updateStatBoxes();
 
-    // Default x-axis window: past 15 years
+    // Default x-axis window: past 18 months
     var defaultStart = (function() {
       var d = new Date();
-      d.setFullYear(d.getFullYear() - 15);
+      d.setMonth(d.getMonth() - 18);
       return d.toISOString().slice(0, 10);
     })();
 
-    // markPoint config: no symbol, text label above (max) / below (min), white bg to avoid overlap
+    // markPoint config: no symbol, text label above (max) / below (min), card bg to avoid overlap
     function makeMarkPoint(color) {
+      var p = chartPalette();
       var labelBase = {
         show: true,
         fontSize: 11,
         fontWeight: 'bold',
         color: color,
         formatter: mpFormatter,
-        backgroundColor: 'rgba(255,255,255,0.82)',
+        backgroundColor: p.bg,
+        borderColor: p.border,
+        borderWidth: 1,
         padding: [2, 5],
         borderRadius: 3,
       };
@@ -354,26 +466,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       };
     }
 
+    var pal = chartPalette();
     chart = echarts.init(document.getElementById('chart'));
 
     chart.setOption({
-      backgroundColor: '#fff',
+      backgroundColor: 'transparent',
+      textStyle: { color: pal.text },
       tooltip: {
         trigger: 'axis',
-        axisPointer: { type: 'cross', crossStyle: { color: '#aaa' } },
+        backgroundColor: pal.tooltip,
+        borderColor: pal.border,
+        textStyle: { color: pal.text },
+        axisPointer: { type: 'cross', crossStyle: { color: pal.muted } },
         formatter: tooltipFormatter,
       },
       legend: {
         data: ['BoC Policy Rate', 'Commercial Prime Rate'],
         top: 8, itemGap: 24,
+        textStyle: { color: pal.text },
       },
       grid: { left: 8, right: 8, top: 48, bottom: 65, containLabel: true },
       xAxis: {
         type: 'time',
         boundaryGap: false,
-        axisLine:  { lineStyle: { color: '#999' } },
-        axisTick:  { lineStyle: { color: '#999' } },
-        axisLabel: { fontSize: 13, color: '#333' },
+        axisLine:  { lineStyle: { color: pal.axis } },
+        axisTick:  { lineStyle: { color: pal.axis } },
+        axisLabel: { fontSize: 13, color: pal.text },
         splitLine: { show: false },
       },
       yAxis: {
@@ -382,10 +500,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         max: function(value) {
           return value.max > 0 ? Math.ceil(value.max * 1.12) : 25;
         },
-        axisLabel: { formatter: '{value}%', fontSize: 13, color: '#333' },
-        axisTick:  { lineStyle: { color: '#999' } },
-        splitLine: { lineStyle: { color: '#e8e8e8' } },
-        axisLine:  { show: true, lineStyle: { color: '#999' } },
+        axisLabel: { formatter: '{value}%', fontSize: 13, color: pal.text },
+        axisTick:  { lineStyle: { color: pal.axis } },
+        splitLine: { lineStyle: { color: pal.grid } },
+        axisLine:  { show: true, lineStyle: { color: pal.axis } },
       },
       dataZoom: [
         {
@@ -404,9 +522,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           filterMode: 'filter',
           startValue: defaultStart,
           bottom: 8, height: 22,
-          borderColor: '#ddd',
-          fillerColor: 'rgba(26,26,46,0.08)',
-          handleStyle: { color: '#1a1a2e' },
+          borderColor: pal.border,
+          fillerColor: 'rgba(128,128,128,0.12)',
+          handleStyle: { color: pal.link },
+          textStyle: { color: pal.muted },
         },
       ],
       series: [
@@ -414,20 +533,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           name: 'BoC Policy Rate',
           type: 'line', step: 'end',
           data: rates.policy.map(function(d) { return [d.date, d.rate]; }),
-          lineStyle: { color: '#2E86AB', width: 2 },
-          itemStyle: { color: '#2E86AB' },
+          lineStyle: { color: pal.policy, width: 2 },
+          itemStyle: { color: pal.policy },
           symbol: 'none',
-          markPoint: makeMarkPoint('#2E86AB'),
+          markPoint: makeMarkPoint(pal.policy),
           markArea: emptyMarkArea,
         },
         {
           name: 'Commercial Prime Rate',
           type: 'line', step: 'end',
           data: rates.prime.map(function(d) { return [d.date, d.rate]; }),
-          lineStyle: { color: '#A23B72', width: 2 },
-          itemStyle: { color: '#A23B72' },
+          lineStyle: { color: pal.prime, width: 2 },
+          itemStyle: { color: pal.prime },
           symbol: 'none',
-          markPoint: makeMarkPoint('#A23B72'),
+          markPoint: makeMarkPoint(pal.prime),
           markArea: emptyMarkArea,
         },
       ],
@@ -452,7 +571,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     // Reset Zoom button
     document.getElementById('resetZoom').addEventListener('click', function() {
       var start = new Date();
-      start.setFullYear(start.getFullYear() - 15);
+      start.setMonth(start.getMonth() - 18);
       var startMs = start.getTime();
       var endMs   = Date.now();
       chart.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0, startValue: startMs, endValue: endMs });
@@ -476,6 +595,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       });
     }
     chart.on('datazoom', updateDots);
+
+    // Theme recolor: merge-apply a palette-derived option when data-theme flips.
+    // setOption(..., false) merges rather than replaces, so zoom state is preserved.
+    function applyThemeToChart() {
+      if (!chart) return;
+      var p = chartPalette();
+      chart.setOption(themedOption(p), false);
+      // markPoint labels capture colors at construction time, so rebuild them.
+      chart.setOption({
+        series: [
+          { markPoint: makeMarkPoint(p.policy) },
+          { markPoint: makeMarkPoint(p.prime) },
+        ],
+      }, false);
+      // If historical events are currently shown, rebuild their label color too.
+      if (eventsVisible) {
+        chart.setOption({
+          series: [ { markArea: buildMarkArea() }, { markArea: emptyMarkArea } ],
+        }, false);
+      }
+    }
+    new MutationObserver(applyThemeToChart).observe(
+      document.documentElement,
+      { attributes: true, attributeFilter: ['data-theme'] }
+    );
 
     // Responsive
     window.addEventListener('resize', function() { chart.resize(); });
