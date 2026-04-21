@@ -177,6 +177,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="footer">
     Data source: <a href="https://www.bankofcanada.ca/valet/docs" target="_blank" rel="external noopener">Bank of Canada Valet API</a>
     &mdash; Built __BUILD_TIME__
+    &mdash; <a href="https://github.com/k1monfared/mortgage_rate_tracker" target="_blank" rel="external noopener">GitHub</a>
     &mdash; <a href="https://k1monfared.github.io/sponsor.html" rel="external noopener">Sponsor</a>
   </div>
 
