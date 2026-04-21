@@ -580,11 +580,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     });
 
     // Show dots only when zoomed inside a 3-year window
-    function updateDots() {
-      var opt = chart.getOption();
-      var dz  = opt.dataZoom && opt.dataZoom[0];
-      if (!dz) return;
-      var rangeMs   = (dz.endValue || 0) - (dz.startValue || 0);
+    function applyDotsForRange(rangeMs) {
       var shouldShow = rangeMs > 0 && rangeMs < THREE_YEARS_MS;
       if (shouldShow === dotsVisible) return;
       dotsVisible = shouldShow;
@@ -595,7 +591,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         ],
       });
     }
+    function toMs(v, fallback) {
+      if (v == null) return fallback;
+      if (typeof v === 'number') return v;
+      var t = new Date(v).getTime();
+      return isNaN(t) ? fallback : t;
+    }
+    function updateDots() {
+      var opt = chart.getOption();
+      var dz  = opt.dataZoom && opt.dataZoom[0];
+      if (!dz) return;
+      var start = toMs(dz.startValue, 0);
+      var end   = toMs(dz.endValue,   Date.now());
+      applyDotsForRange(end - start);
+    }
     chart.on('datazoom', updateDots);
+
+    // Initial render doesn't emit a datazoom event, so evaluate the default
+    // window (defaultStart → today) directly to set dot visibility.
+    applyDotsForRange(Date.now() - toMs(defaultStart, 0));
 
     // Theme recolor: merge-apply a palette-derived option when data-theme flips.
     // setOption(..., false) merges rather than replaces, so zoom state is preserved.
