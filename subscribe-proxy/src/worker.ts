@@ -44,7 +44,13 @@ export interface Env {
   [key: string]: string | KVNamespace | D1Database | undefined;
 }
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Strict character class: rejects whitespace, HTML-active characters
+// (`<`, `>`, `"`, `'`), and other punctuation that is legal per RFC 5322 but
+// almost never seen in practice. The goal is defense in depth — even though
+// the email is HTML-escaped before substitution into the confirmation email
+// body, a tight input filter prevents weird payloads from reaching any
+// downstream system that might not escape.
+const EMAIL_RE = /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/;
 const TOKEN_RE = /^[a-f0-9]{64}$/;
 const TOKEN_TTL_SECONDS = 60 * 60 * 24;
 const RATE_LIMIT_TTL_SECONDS = 60 * 60 * 24;
@@ -244,19 +250,29 @@ async function sendConfirmationEmail(
   blockUrl: string,
   lists: string[],
 ): Promise<boolean> {
-  const vars = {
+  // Two vars sets: one raw (for subject and plain text), one with every user-
+  // controllable field HTML-escaped before substitution into the HTML body.
+  // `confirm_url` and `block_url` are worker-generated token URLs so they
+  // contain no user content, but escaping them is still cheap insurance.
+  const varsText = {
     email: to,
     confirm_url: confirmUrl,
     block_url: blockUrl,
     site_name: env.SITE_NAME,
     list_labels: formatListLabels(lists),
   };
+  const varsHtml = {
+    ...varsText,
+    email:       escapeHtml(to),
+    site_name:   escapeHtml(env.SITE_NAME || ""),
+    list_labels: escapeHtml(formatListLabels(lists)),
+  };
   const payload = {
     from: env.FROM_ADDR,
     to,
-    subject: fillTemplate(CONFIRMATION_TEMPLATE.subject, vars),
-    html: fillTemplate(CONFIRMATION_TEMPLATE.html, vars),
-    text: fillTemplate(CONFIRMATION_TEMPLATE.text, vars),
+    subject: fillTemplate(CONFIRMATION_TEMPLATE.subject, varsText),
+    html: fillTemplate(CONFIRMATION_TEMPLATE.html, varsHtml),
+    text: fillTemplate(CONFIRMATION_TEMPLATE.text, varsText),
   };
   const resp = await fetch("https://api.resend.com/emails", {
     method: "POST",
