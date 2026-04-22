@@ -2,6 +2,10 @@
   "ca": {
     "changes": [
       {
+        "date": "2025-11-01",
+        "value": 2.5
+      },
+      {
         "date": "2025-11-05",
         "value": 4.45
       },
@@ -14,13 +18,13 @@
         "value": 4.95
       }
     ],
-    "series": "Canadian Commercial Prime Rate"
+    "series": "Bank of Canada policy rate"
   },
   "us": {
     "changes": [
       {
         "date": "2025-12-11",
-        "value": 6.75
+        "value": 3.75
       },
       {
         "date": "2025-10-30",
@@ -31,6 +35,6 @@
         "value": 7.25
       }
     ],
-    "series": "US Bank Prime Rate"
+    "series": "Fed target rate (upper bound)"
   }
 }
