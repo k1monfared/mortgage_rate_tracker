@@ -17,3 +17,10 @@ __pycache__/
 # Generated output (CI builds these fresh each run)
 site/
 output/
+
+# Email drafts regenerated via `python send_rate_emails.py --draft <region>`
+email_draft.md
+drafts/
+
+# Playwright MCP session artifacts (local browser testing)
+.playwright-mcp/

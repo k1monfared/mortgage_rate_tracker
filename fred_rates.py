@@ -7,8 +7,9 @@ fredgraph CSV endpoint, which is public and requires no API key.
 Public API mirrors HistoricalRateFetcher so build_site.py can treat both
 fetchers identically. rate_type tokens:
 
-    "policy" -> DFF    (Federal Funds Effective Rate, daily)
-    "prime"  -> DPRIME (Bank Prime Loan Rate, daily)
+    "policy" -> DFF      (Federal Funds Effective Rate, daily)
+    "prime"  -> DPRIME   (Bank Prime Loan Rate, daily)
+    "target" -> DFEDTARU (FOMC target rate upper bound, daily)
 
 CSV schema on disk is the same as the BoC side: columns date,rate.
 """
@@ -29,6 +30,7 @@ FRED_BASE_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 
 FED_FUNDS_CSV = DATA_DIR / "us_fed_funds_rate.csv"
 US_PRIME_CSV = DATA_DIR / "us_prime_rate.csv"
+US_FED_TARGET_CSV = DATA_DIR / "us_fed_target_upper.csv"
 US_METADATA_JSON = DATA_DIR / "us_metadata.json"
 
 
@@ -36,8 +38,9 @@ class FREDRateFetcher:
     """Fetches and manages US interest rate data from FRED (St. Louis Fed)."""
 
     SERIES = {
-        "policy": ("DFF",    FED_FUNDS_CSV, "Fed Funds Rate"),
-        "prime":  ("DPRIME", US_PRIME_CSV,  "US Bank Prime Rate"),
+        "policy": ("DFF",      FED_FUNDS_CSV,     "Fed Funds Rate"),
+        "prime":  ("DPRIME",   US_PRIME_CSV,      "US Bank Prime Rate"),
+        "target": ("DFEDTARU", US_FED_TARGET_CSV, "Fed Target Rate (Upper Bound)"),
     }
 
     def __init__(self):

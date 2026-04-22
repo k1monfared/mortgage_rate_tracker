@@ -51,6 +51,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       --card-border: #30363d;
       --muted: #8b949e;
       --accent-policy: #58a6ff;
+      --accent-target: #ffb86c;
       --accent-prime:  #d2a8ff;
       --chart-axis: #8b949e;
       --chart-grid: #30363d;
@@ -62,6 +63,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       --card-border: #e1e4e8;
       --muted: #6a737d;
       --accent-policy: #2E86AB;
+      --accent-target: #C25500;
       --accent-prime:  #A23B72;
       --chart-axis: #6a737d;
       --chart-grid: #e1e4e8;
@@ -284,7 +286,14 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
   var SLUG         = '__SLUG__';
   var LABEL_POLICY = '__LABEL_POLICY__';
   var LABEL_PRIME  = '__LABEL_PRIME__';
+  var LABEL_TARGET = '__LABEL_TARGET__';
   var STATE_KEY    = 'tracker.state.' + SLUG;
+
+  // Ordered list of series present on this chart. Populated once rates.json
+  // loads, since the target series is US-only. Everything downstream
+  // (legend, chart series, tooltip, theme recolor, events markArea, dots)
+  // iterates over this list.
+  var SERIES_DEFS = [];
 
   // ── Theme palette (reads live CSS variables so it tracks the toggle) ───
   function chartPalette() {
@@ -303,8 +312,23 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       border:   v('--card-border',    '#30363d'),
       link:     v('--link',           '#58a6ff'),
       policy:   v('--accent-policy',  '#58a6ff'),
+      target:   v('--accent-target',  '#ffb86c'),
       prime:    v('--accent-prime',   '#d2a8ff'),
     };
+  }
+
+  function buildSeriesDefs(pal) {
+    // Display order: policy (central bank), target (US only), prime (commercial).
+    // Lines are drawn in this order; the tooltip sorts by value so its top-to-
+    // bottom order always matches the visual vertical stacking on the chart.
+    var defs = [
+      { key: 'policy', label: LABEL_POLICY, color: pal.policy },
+    ];
+    if (rates && rates.target && LABEL_TARGET) {
+      defs.push({ key: 'target', label: LABEL_TARGET, color: pal.target });
+    }
+    defs.push({ key: 'prime', label: LABEL_PRIME, color: pal.prime });
+    return defs;
   }
 
   function themedOption(p) {
@@ -334,18 +358,13 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
         { borderColor: p.border, fillerColor: 'rgba(128,128,128,0.12)',
           handleStyle: { color: p.link }, textStyle: { color: p.muted } },
       ],
-      series: [
-        {
-          lineStyle: { color: p.policy },
-          itemStyle: { color: p.policy },
-          markPoint: { label: { color: p.policy, backgroundColor: p.bg, borderColor: p.border } },
-        },
-        {
-          lineStyle: { color: p.prime },
-          itemStyle: { color: p.prime },
-          markPoint: { label: { color: p.prime, backgroundColor: p.bg, borderColor: p.border } },
-        },
-      ],
+      series: SERIES_DEFS.map(function(def) {
+        return {
+          lineStyle: { color: def.color },
+          itemStyle: { color: def.color },
+          markPoint: { label: { color: def.color, backgroundColor: p.bg, borderColor: p.border } },
+        };
+      }),
     };
   }
 
@@ -389,10 +408,14 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
   var emptyMarkArea = { data: [] };
 
   function findStepRate(series, ts) {
+    // Dates in rates.json are "YYYY-MM-DD"; JS Date() parses these as UTC
+    // midnight, matching how ECharts places the point on the x-axis. Using
+    // the same epoch on both sides ensures that on a change date we return
+    // the NEW rate (matching the step line), not the previous one.
     var lo = 0, hi = series.length - 1, result = null;
     while (lo <= hi) {
       var mid = (lo + hi) >> 1;
-      var midTs = new Date(series[mid].date + 'T12:00:00Z').getTime();
+      var midTs = new Date(series[mid].date).getTime();
       if (midTs <= ts) { result = series[mid].rate; lo = mid + 1; }
       else              { hi = mid - 1; }
     }
@@ -401,18 +424,19 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
 
   function tooltipFormatter(params) {
     if (!params || !params.length) return '';
-    var p = chartPalette();
     var ts   = params[0].axisValue;
     var date = new Date(ts).toISOString().slice(0, 10);
-    var pRate = findStepRate(rates.policy, ts);
-    var qRate = findStepRate(rates.prime,  ts);
-    var html  = '<strong>' + date + '</strong><br>';
-    if (pRate !== null)
-      html += '<span style="color:' + p.policy + '">&#9679;</span> ' + LABEL_POLICY + ': <strong>'
-            + pRate.toFixed(2) + '%</strong><br>';
-    if (qRate !== null)
-      html += '<span style="color:' + p.prime + '">&#9679;</span> ' + LABEL_PRIME + ': <strong>'
-            + qRate.toFixed(2) + '%</strong><br>';
+    var items = SERIES_DEFS.map(function(def) {
+      return { label: def.label, color: def.color, rate: findStepRate(rates[def.key], ts) };
+    }).filter(function(it) { return it.rate !== null; });
+    // Sort by rate descending so the tooltip lists series top-to-bottom in
+    // the same vertical order the lines stack on the chart at this x.
+    items.sort(function(a, b) { return b.rate - a.rate; });
+    var html = '<strong>' + date + '</strong><br>';
+    items.forEach(function(it) {
+      html += '<span style="color:' + it.color + '">&#9679;</span> ' + it.label
+           + ': <strong>' + it.rate.toFixed(2) + '%</strong><br>';
+    });
     return html;
   }
 
@@ -427,10 +451,9 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
 
   function updateChartSeries() {
     chart.setOption({
-      series: [
-        { data: rates.policy.map(function(d) { return [d.date, d.rate]; }) },
-        { data: rates.prime.map(function(d)  { return [d.date, d.rate]; }) },
-      ],
+      series: SERIES_DEFS.map(function(def) {
+        return { data: rates[def.key].map(function(d) { return [d.date, d.rate]; }) };
+      }),
     });
   }
 
@@ -471,6 +494,9 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
 
     updateStatBoxes();
 
+    var pal = chartPalette();
+    SERIES_DEFS = buildSeriesDefs(pal);
+
     // Default x-axis window: past 18 months
     var defaultStart = (function() {
       var d = new Date();
@@ -508,7 +534,6 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       };
     }
 
-    var pal = chartPalette();
     chart = echarts.init(document.getElementById('chart'));
 
     chart.setOption({
@@ -523,7 +548,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
         formatter: tooltipFormatter,
       },
       legend: {
-        data: [LABEL_POLICY, LABEL_PRIME],
+        data: SERIES_DEFS.map(function(d) { return d.label; }),
         top: 8, itemGap: 24,
         textStyle: { color: pal.text },
       },
@@ -570,38 +595,29 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
           textStyle: { color: pal.muted },
         },
       ],
-      series: [
-        {
-          name: LABEL_POLICY,
+      series: SERIES_DEFS.map(function(def) {
+        return {
+          name: def.label,
           type: 'line', step: 'end',
-          data: rates.policy.map(function(d) { return [d.date, d.rate]; }),
-          lineStyle: { color: pal.policy, width: 2 },
-          itemStyle: { color: pal.policy },
+          data: rates[def.key].map(function(d) { return [d.date, d.rate]; }),
+          lineStyle: { color: def.color, width: 2 },
+          itemStyle: { color: def.color },
           symbol: 'none',
-          markPoint: makeMarkPoint(pal.policy),
+          markPoint: makeMarkPoint(def.color),
           markArea: emptyMarkArea,
-        },
-        {
-          name: LABEL_PRIME,
-          type: 'line', step: 'end',
-          data: rates.prime.map(function(d) { return [d.date, d.rate]; }),
-          lineStyle: { color: pal.prime, width: 2 },
-          itemStyle: { color: pal.prime },
-          symbol: 'none',
-          markPoint: makeMarkPoint(pal.prime),
-          markArea: emptyMarkArea,
-        },
-      ],
+        };
+      }),
     });
 
-    // Events toggle
+    // Events toggle — markArea lives on the first series only (one band per
+    // region); the other series always get the empty markArea placeholder.
     function setEventsVisible(v) {
       eventsVisible = v;
       chart.setOption({
-        series: [
-          { markArea: eventsVisible ? buildMarkArea() : emptyMarkArea },
-          { markArea: emptyMarkArea },
-        ],
+        series: SERIES_DEFS.map(function(_, i) {
+          if (i === 0) return { markArea: eventsVisible ? buildMarkArea() : emptyMarkArea };
+          return { markArea: emptyMarkArea };
+        }),
       });
       var btn = document.getElementById('toggleEvents');
       btn.textContent = eventsVisible ? 'Hide Historical Events' : 'Show Historical Events';
@@ -628,10 +644,9 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       if (shouldShow === dotsVisible) return;
       dotsVisible = shouldShow;
       chart.setOption({
-        series: [
-          { symbol: dotsVisible ? 'circle' : 'none', symbolSize: 5 },
-          { symbol: dotsVisible ? 'circle' : 'none', symbolSize: 5 },
-        ],
+        series: SERIES_DEFS.map(function() {
+          return { symbol: dotsVisible ? 'circle' : 'none', symbolSize: 5 };
+        }),
       });
     }
     function toMs(v, fallback) {
@@ -675,16 +690,22 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     function applyThemeToChart() {
       if (!chart) return;
       var p = chartPalette();
+      // Refresh the color cache on each series def so tooltip items pick up
+      // the new theme colors too.
+      SERIES_DEFS = SERIES_DEFS.map(function(d) {
+        return { key: d.key, label: d.label, color: p[d.key] };
+      });
       chart.setOption(themedOption(p), false);
       chart.setOption({
-        series: [
-          { markPoint: makeMarkPoint(p.policy) },
-          { markPoint: makeMarkPoint(p.prime) },
-        ],
+        series: SERIES_DEFS.map(function(def) {
+          return { markPoint: makeMarkPoint(def.color) };
+        }),
       }, false);
       if (eventsVisible) {
         chart.setOption({
-          series: [ { markArea: buildMarkArea() }, { markArea: emptyMarkArea } ],
+          series: SERIES_DEFS.map(function(_, i) {
+            return { markArea: i === 0 ? buildMarkArea() : emptyMarkArea };
+          }),
         }, false);
       }
     }
@@ -1020,6 +1041,7 @@ REGIONS = [
         "title": "US Interest Rate Tracker",
         "fetcher": FREDRateFetcher(),
         "labels": {"policy": "Fed Funds Rate",
+                   "target": "Fed Target (Upper)",
                    "prime":  "US Bank Prime Rate"},
         "source_name": "Federal Reserve Economic Data (FRED)",
         "source_url":  "https://fred.stlouisfed.org/",
@@ -1029,7 +1051,12 @@ REGIONS = [
 
 
 def write_rates_json(cfg, out_path, build_time):
-    """Serialize a region's rates + metadata to JSON."""
+    """Serialize a region's rates + metadata to JSON.
+
+    Always writes `policy` and `prime` arrays. If the region's fetcher also
+    exposes a `target` series (currently US only, FOMC target upper bound),
+    that array is written too along with `target_current` meta fields.
+    """
     fetcher  = cfg["fetcher"]
     policy_df = fetcher.load_rate_data("policy")
     prime_df  = fetcher.load_rate_data("prime")
@@ -1057,10 +1084,26 @@ def write_rates_json(cfg, out_path, build_time):
             "labels": cfg["labels"],
         },
     }
+
+    has_target = "target" in getattr(fetcher, "SERIES", {})
+    if has_target:
+        target_df = fetcher.load_rate_data("target")
+        if target_df is not None and not target_df.empty:
+            payload["target"] = [
+                {"date": row["date"].strftime("%Y-%m-%d"), "rate": float(row["rate"])}
+                for _, row in target_df.iterrows()
+            ]
+            latest_target = target_df.iloc[-1]
+            payload["meta"]["target_current"]      = float(latest_target["rate"])
+            payload["meta"]["target_current_date"] = latest_target["date"].strftime("%Y-%m-%d")
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(payload, f, separators=(",", ":"))
-    print(f"Wrote {out_path} ({len(payload['policy'])} policy, {len(payload['prime'])} prime records)")
+    counts = f"{len(payload['policy'])} policy, {len(payload['prime'])} prime"
+    if "target" in payload:
+        counts += f", {len(payload['target'])} target"
+    print(f"Wrote {out_path} ({counts} records)")
 
 
 def render_region(cfg, build_time):
@@ -1069,6 +1112,7 @@ def render_region(cfg, build_time):
         "__TITLE__":          cfg["title"],
         "__LABEL_POLICY__":   cfg["labels"]["policy"],
         "__LABEL_PRIME__":    cfg["labels"]["prime"],
+        "__LABEL_TARGET__":   cfg["labels"].get("target", ""),
         "__SOURCE_NAME__":    cfg["source_name"],
         "__SOURCE_URL__":     cfg["source_url"],
         "__SLUG__":           slug,
@@ -1098,8 +1142,8 @@ def build_site():
         slug = cfg["slug"]
         print(f"\n{'=' * 70}\nBuilding region: {slug}\n{'=' * 70}")
         fetcher = cfg["fetcher"]
-        fetcher.update_incremental("policy")
-        fetcher.update_incremental("prime")
+        for series_key in getattr(fetcher, "SERIES", {}).keys() or ("policy", "prime"):
+            fetcher.update_incremental(series_key)
 
         out_dir = site_dir / slug
         out_dir.mkdir(parents=True, exist_ok=True)
