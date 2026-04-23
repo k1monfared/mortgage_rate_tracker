@@ -113,9 +113,19 @@ DELETE FROM subscribers WHERE email = 'someone@example.com' AND list = 'ca';
 
 See [`subscribe-proxy/README.md`](subscribe-proxy/README.md) for the full schema and more helper queries.
 
-## BoC Monitor (AI Analysis)
+## BoC Monitor (AI Analysis, future plan)
 
-`boc_monitor.py` uses Claude AI to analyze Bank of Canada press releases and speeches and assess the monetary policy stance (hawkish / dovish / hold). See [README_BOC_MONITOR.md](README_BOC_MONITOR.md) for full details.
+`boc_monitor.py` is a CLI-only tool that uses Claude AI to analyze Bank of Canada press releases, the Monetary Policy Report, and speeches, then synthesizes a stance (hawkish, dovish, hold, or mixed) with confidence, rate-change probability, direction, inflation concern, growth outlook, and key signals per source. When run, it writes `output/boc_analysis_YYYYMMDD_HHMMSS.txt` and `.json` locally. See [README_BOC_MONITOR.md](README_BOC_MONITOR.md) for full details.
+
+**Current status:** not wired into the automated pipeline. `boc_monitor.py` is not referenced in `.github/workflows/deploy.yml`, its output does not land in `site/`, and the subscriber emails do not include it. The recurring LLM cost is not justified at the current audience size.
+
+**To enable later**, three pieces are needed:
+
+1. A scheduled step in `deploy.yml` that runs `boc_monitor.py` with an Anthropic API key (via `secrets.ANTHROPIC_API_KEY`), at a cadence matched to BoC announcement days rather than every build.
+2. An output format that writes to `site/ca/analysis.json` (stance, confidence, probability, direction, timestamp, source list) so the static site can read it.
+3. A card or section on `site/ca/index.html` that fetches `analysis.json` at page load and renders the synthesis, plus an optional inclusion in the rate-change email body.
+
+A companion pipeline for US (FOMC statements, minutes, SEP, speeches) could follow the same shape once the Canadian side is validated.
 
 ## Disclaimer
 
