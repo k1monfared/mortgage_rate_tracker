@@ -6,16 +6,16 @@
         "value": 2.5
       },
       {
-        "date": "2025-11-05",
-        "value": 4.45
+        "date": "2025-09-01",
+        "value": 2.75
       },
       {
-        "date": "2025-09-24",
-        "value": 4.7
+        "date": "2025-03-01",
+        "value": 3.0
       },
       {
-        "date": "2025-03-19",
-        "value": 4.95
+        "date": "2025-02-01",
+        "value": 3.25
       }
     ],
     "series": "Bank of Canada policy rate"
@@ -28,11 +28,15 @@
       },
       {
         "date": "2025-10-30",
-        "value": 7.0
+        "value": 4.0
       },
       {
-        "date": "2025-09-17",
-        "value": 7.25
+        "date": "2025-09-18",
+        "value": 4.25
+      },
+      {
+        "date": "2024-12-19",
+        "value": 4.5
       }
     ],
     "series": "Fed target rate (upper bound)"

@@ -4,5 +4,11 @@
     "refreshed_at": "2026-04-22T23:14:53Z",
     "samples": 9,
     "window_start": "2024-04-15"
+  },
+  "us": {
+    "median_days": 42,
+    "refreshed_at": "2026-04-23T05:31:16Z",
+    "samples": 4,
+    "window_start": "2024-04-22"
   }
 }

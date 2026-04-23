@@ -596,10 +596,21 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
         },
       ],
       series: SERIES_DEFS.map(function(def) {
+        var raw = rates[def.key];
+        var data = raw.map(function(d) { return [d.date, d.rate]; });
+        // Extend the step line to today so a series whose last observation
+        // predates the chart's right edge still shows its current rate across
+        // the full window. The per-point symbol: 'none' keeps the dots-on
+        // toggle from marking this synthetic point as an observation.
+        var last = raw[raw.length - 1];
+        var todayStr = today();
+        if (last && last.date < todayStr) {
+          data.push({ value: [todayStr, last.rate], symbol: 'none' });
+        }
         return {
           name: def.label,
           type: 'line', step: 'end',
-          data: rates[def.key].map(function(d) { return [d.date, d.rate]; }),
+          data: data,
           lineStyle: { color: def.color, width: 2 },
           itemStyle: { color: def.color },
           symbol: 'none',
@@ -1035,6 +1046,7 @@ REGIONS = [
         "source_name": "Bank of Canada Valet API",
         "source_url":  "https://www.bankofcanada.ca/valet/docs",
         "events_file": Path("data/events.json"),
+        "meetings_file": None,
     },
     {
         "slug": "us",
@@ -1046,8 +1058,69 @@ REGIONS = [
         "source_name": "Federal Reserve Economic Data (FRED)",
         "source_url":  "https://fred.stlouisfed.org/",
         "events_file": Path("data/us_events.json"),
+        "meetings_file": Path("data/us_fomc_meetings.json"),
     },
 ]
+
+
+def _load_meeting_dates(meetings_file):
+    """Return a set of YYYY-MM-DD strings from a meetings JSON file, or None
+    if the file is missing / unreadable."""
+    if meetings_file is None or not meetings_file.exists():
+        return None
+    try:
+        with open(meetings_file) as f:
+            return set(json.load(f).get("dates", []))
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  Warning: could not read {meetings_file}: {e}")
+        return None
+
+
+def _compress_series(df, meeting_dates=None, min_delta=0.0):
+    """Keep only rows that carry information for the step chart:
+
+    - the first row (establishes the starting value),
+    - the last row (extends the line to 'today'),
+    - every rate transition where |rate - prev_kept| > min_delta,
+    - every row whose date is in `meeting_dates` (shows a dot on days the
+      central bank met, even when the rate didn't change).
+
+    `min_delta` lets series like the Fed Funds effective rate (which wiggles
+    daily by a basis point or two) drop noise-level changes while still
+    capturing every announcement-day dot.
+    """
+    if df is None or df.empty:
+        return df
+    rows = df.reset_index(drop=True)
+    keep = [False] * len(rows)
+    keep[0] = True
+    keep[-1] = True
+    prev_kept = float(rows.iloc[0]["rate"])
+    for i in range(1, len(rows) - 1):
+        rate = float(rows.iloc[i]["rate"])
+        date_str = rows.iloc[i]["date"].strftime("%Y-%m-%d")
+        is_transition = abs(rate - prev_kept) > min_delta
+        is_meeting = meeting_dates is not None and date_str in meeting_dates
+        if is_transition or is_meeting:
+            keep[i] = True
+            prev_kept = rate
+    return rows[keep].reset_index(drop=True)
+
+
+# Per-series compression tuning. Fed Funds effective rate has daily float
+# noise (~1bp); the others are piecewise-constant by construction.
+_SERIES_MIN_DELTA = {
+    "policy": 0.01,
+    "target": 0.0,
+    "prime":  0.0,
+}
+
+
+def _series_to_json(df):
+    return [
+        {"date": row["date"].strftime("%Y-%m-%d"), "rate": float(row["rate"])}
+        for _, row in df.iterrows()
+    ]
 
 
 def write_rates_json(cfg, out_path, build_time):
@@ -1056,6 +1129,11 @@ def write_rates_json(cfg, out_path, build_time):
     Always writes `policy` and `prime` arrays. If the region's fetcher also
     exposes a `target` series (currently US only, FOMC target upper bound),
     that array is written too along with `target_current` meta fields.
+
+    Daily series are compressed to transitions + central-bank-meeting days
+    (when a meetings file is configured for the region), so the step chart
+    renders with dots on rate-change days AND on announcement days where the
+    rate was held, without 10k+ daily points weighing down the payload.
     """
     fetcher  = cfg["fetcher"]
     policy_df = fetcher.load_rate_data("policy")
@@ -1066,15 +1144,23 @@ def write_rates_json(cfg, out_path, build_time):
     latest_policy = policy_df.iloc[-1]
     latest_prime  = prime_df.iloc[-1]
 
+    # Only compress regions with daily data (flagged by having a meetings_file).
+    # Monthly/weekly series (e.g. Canada) pass through as-is so the chart keeps
+    # a dot on every reported data point.
+    if cfg.get("meetings_file"):
+        meeting_dates = _load_meeting_dates(cfg["meetings_file"])
+        policy_compressed = _compress_series(policy_df, meeting_dates,
+                                             _SERIES_MIN_DELTA["policy"])
+        prime_compressed  = _compress_series(prime_df,  meeting_dates,
+                                             _SERIES_MIN_DELTA["prime"])
+    else:
+        meeting_dates = None
+        policy_compressed = policy_df
+        prime_compressed  = prime_df
+
     payload = {
-        "policy": [
-            {"date": row["date"].strftime("%Y-%m-%d"), "rate": float(row["rate"])}
-            for _, row in policy_df.iterrows()
-        ],
-        "prime": [
-            {"date": row["date"].strftime("%Y-%m-%d"), "rate": float(row["rate"])}
-            for _, row in prime_df.iterrows()
-        ],
+        "policy": _series_to_json(policy_compressed),
+        "prime":  _series_to_json(prime_compressed),
         "meta": {
             "policy_current":      float(latest_policy["rate"]),
             "policy_current_date": latest_policy["date"].strftime("%Y-%m-%d"),
@@ -1089,10 +1175,12 @@ def write_rates_json(cfg, out_path, build_time):
     if has_target:
         target_df = fetcher.load_rate_data("target")
         if target_df is not None and not target_df.empty:
-            payload["target"] = [
-                {"date": row["date"].strftime("%Y-%m-%d"), "rate": float(row["rate"])}
-                for _, row in target_df.iterrows()
-            ]
+            if cfg.get("meetings_file"):
+                target_compressed = _compress_series(target_df, meeting_dates,
+                                                     _SERIES_MIN_DELTA["target"])
+            else:
+                target_compressed = target_df
+            payload["target"] = _series_to_json(target_compressed)
             latest_target = target_df.iloc[-1]
             payload["meta"]["target_current"]      = float(latest_target["rate"])
             payload["meta"]["target_current_date"] = latest_target["date"].strftime("%Y-%m-%d")

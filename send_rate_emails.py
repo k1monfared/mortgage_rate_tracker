@@ -349,8 +349,9 @@ def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[
     # Prime context at the change date.
     prime_at_change = prime_on_date(prime_csv, newest["date"])
     prime_now, _ = current_prime(prime_csv)
-    # Value to display in the lede: "today the prime rate is X.XX%" means the
-    # value as of the change date (which is "today" from the email's POV).
+    # Value to display in the lede: prime rate as of the change date. Falls
+    # back to the most recent prime observation if we have nothing on/before
+    # the change date.
     prime_lede = prime_at_change if prime_at_change is not None else prime_now
     # Read from the cached lag (refreshed whenever a change is detected by
     # process_region or refresh_lag_for_region). Never recompute here.
@@ -366,8 +367,8 @@ def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[
     md_lines.append("")
     if delta_str:
         md_lines.append(
-            f"The **{cfg['label']}** {direction} to **{rate_pct}** today "
-            f"({newest['date']}) by {delta_str}."
+            f"The **{cfg['label']}** {direction} to **{rate_pct}** "
+            f"on {newest['date']} by {delta_str}."
         )
     else:
         md_lines.append(
@@ -415,7 +416,7 @@ def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[
     if delta_str:
         lede_html = (
             f"<p>The <strong>{cfg['label']}</strong> {direction} to "
-            f"<strong>{rate_pct}</strong> today ({newest['date']}) by {delta_str}.</p>"
+            f"<strong>{rate_pct}</strong> on {newest['date']} by {delta_str}.</p>"
         )
     else:
         lede_html = (
@@ -479,8 +480,8 @@ def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[
     text_lines: List[str] = []
     if delta_str:
         text_lines.append(
-            f"The {cfg['label']} {direction} to {rate_pct} today "
-            f"({newest['date']}) by {delta_str}."
+            f"The {cfg['label']} {direction} to {rate_pct} "
+            f"on {newest['date']} by {delta_str}."
         )
     else:
         text_lines.append(f"The {cfg['label']} is now {rate_pct} as of {newest['date']}.")
@@ -571,9 +572,18 @@ def process_region(slug: str, state: Dict, proxy_url: Optional[str],
 
     region_block = state.get(slug, {})
     stored = region_block.get("changes", [])
+    stored_series = region_block.get("series")
 
-    if not stored:
-        print(f"[{slug}] Seeding initial history with last {len(latest)} changes.")
+    # Reseed on first run OR when the stored series doesn't match the current
+    # trigger (e.g. leftover entries from a different series before a refactor).
+    # Without this guard, merge_new_change would prepend the new change onto
+    # unrelated history, producing a mixed-series table.
+    if not stored or stored_series != cfg["label"]:
+        if stored and stored_series != cfg["label"]:
+            print(f"[{slug}] Stored series '{stored_series}' != configured "
+                  f"'{cfg['label']}' — reseeding history from {trigger_csv}.")
+        else:
+            print(f"[{slug}] Seeding initial history with last {len(latest)} changes.")
         return {"series": cfg["label"], "changes": latest}
 
     merged, new_change = merge_new_change(stored, latest)
