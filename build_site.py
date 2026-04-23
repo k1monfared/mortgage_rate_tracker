@@ -596,21 +596,13 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
         },
       ],
       series: SERIES_DEFS.map(function(def) {
-        var raw = rates[def.key];
-        var data = raw.map(function(d) { return [d.date, d.rate]; });
-        // Extend the step line to today so a series whose last observation
-        // predates the chart's right edge still shows its current rate across
-        // the full window. The per-point symbol: 'none' keeps the dots-on
-        // toggle from marking this synthetic point as an observation.
-        var last = raw[raw.length - 1];
-        var todayStr = today();
-        if (last && last.date < todayStr) {
-          data.push({ value: [todayStr, last.rate], symbol: 'none' });
-        }
         return {
           name: def.label,
           type: 'line', step: 'end',
-          data: data,
+          // Initial data is the raw series. updateDots() runs on init and on
+          // every zoom change, and rewrites this array with synthetic edge
+          // points at the window boundaries (see buildWindowedSeriesData).
+          data: rates[def.key].map(function(d) { return [d.date, d.rate]; }),
           lineStyle: { color: def.color, width: 2 },
           itemStyle: { color: def.color },
           symbol: 'none',
@@ -666,20 +658,72 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       var t = new Date(v).getTime();
       return isNaN(t) ? fallback : t;
     }
+    // Build a series data array for the visible window [xMinMs, xMaxMs].
+    //   - Line stops at the last real observation globally: if the series has
+    //     no data after xMax, no right edge extension is added.
+    //   - If data exists before the window, a synthetic point at xMin carries
+    //     the last-known rate in from the left, so the step line enters at
+    //     the correct level.
+    //   - If data exists after xMax, a synthetic point at xMax extends the
+    //     step line to the right edge at the most recent in-window value.
+    // Synthetic edge points carry `symbol: 'none'` so the dots-on toggle
+    // never marks them as observations.
+    function buildWindowedSeriesData(raw, xMinMs, xMaxMs) {
+      if (!raw || raw.length === 0) return [];
+      var data = raw.map(function(d) { return [d.date, d.rate]; });
+      var prevPoint = null, hasNext = false, lastRateInWindow = null;
+      for (var i = 0; i < raw.length; i++) {
+        var ts = new Date(raw[i].date).getTime();
+        if (ts < xMinMs) {
+          prevPoint = raw[i];
+        } else if (ts > xMaxMs) {
+          hasNext = true;
+          break;
+        } else {
+          lastRateInWindow = raw[i].rate;
+        }
+      }
+      var xMinDate = new Date(xMinMs).toISOString().slice(0, 10);
+      var xMaxDate = new Date(xMaxMs).toISOString().slice(0, 10);
+      if (prevPoint) {
+        data.unshift({ value: [xMinDate, prevPoint.rate], symbol: 'none' });
+      }
+      if (hasNext) {
+        var r = lastRateInWindow != null ? lastRateInWindow
+              : (prevPoint ? prevPoint.rate : null);
+        if (r != null) {
+          data.push({ value: [xMaxDate, r], symbol: 'none' });
+        }
+      }
+      return data;
+    }
+    function applyWindowedSeries(xMinMs, xMaxMs) {
+      chart.setOption({
+        series: SERIES_DEFS.map(function(def) {
+          return { data: buildWindowedSeriesData(rates[def.key], xMinMs, xMaxMs) };
+        }),
+      });
+    }
     function updateDots() {
       var opt = chart.getOption();
       var dz  = opt.dataZoom && opt.dataZoom[0];
       if (!dz) return;
       var start = toMs(dz.startValue, 0);
       var end   = toMs(dz.endValue,   Date.now());
+      applyWindowedSeries(start, end);
       applyDotsForRange(end - start);
       saveState({ zoomStartMs: start, zoomEndMs: end });
     }
     chart.on('datazoom', updateDots);
 
     // Initial render doesn't emit a datazoom event, so evaluate the default
-    // window (defaultStart → today) directly to set dot visibility.
-    applyDotsForRange(Date.now() - toMs(defaultStart, 0));
+    // window (defaultStart → today) directly to set edges and dot visibility.
+    (function initWindow() {
+      var startMs = toMs(defaultStart, 0);
+      var endMs   = Date.now();
+      applyWindowedSeries(startMs, endMs);
+      applyDotsForRange(endMs - startMs);
+    })();
 
     // Restore saved per-region state, if any.
     var saved = loadState();
