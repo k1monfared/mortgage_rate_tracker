@@ -683,16 +683,18 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
           lastRateInWindow = raw[i].rate;
         }
       }
-      var xMinDate = new Date(xMinMs).toISOString().slice(0, 10);
-      var xMaxDate = new Date(xMaxMs).toISOString().slice(0, 10);
+      // Use the window's numeric timestamps directly for the synthetic edges,
+      // NOT a truncated "YYYY-MM-DD" string. Truncation pushes the point back
+      // to UTC midnight, which can land a few hours before xMinMs and get
+      // filtered out when the user has zoomed to a mid-day boundary.
       if (prevPoint) {
-        data.unshift({ value: [xMinDate, prevPoint.rate], symbol: 'none' });
+        data.unshift({ value: [xMinMs, prevPoint.rate], symbol: 'none' });
       }
       if (hasNext) {
         var r = lastRateInWindow != null ? lastRateInWindow
               : (prevPoint ? prevPoint.rate : null);
         if (r != null) {
-          data.push({ value: [xMaxDate, r], symbol: 'none' });
+          data.push({ value: [xMaxMs, r], symbol: 'none' });
         }
       }
       return data;
