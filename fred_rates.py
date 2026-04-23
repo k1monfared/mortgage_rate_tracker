@@ -80,6 +80,13 @@ class FREDRateFetcher:
             if len(df) < initial_len:
                 print(f"   ⚠️  Dropped {initial_len - len(df)} rows with missing rates")
 
+            # FRED's fredgraph.csv endpoint ignores the cosd/coed parameters and
+            # always returns the full series. Clip to the requested range here
+            # so incremental updates don't rewrite the whole CSV every run.
+            lo = pd.Timestamp(start_date.date())
+            hi = pd.Timestamp(end_date.date())
+            df = df[(df["date"] >= lo) & (df["date"] <= hi)]
+
             df = df.sort_values("date")
             print(f"   ✓ Fetched {len(df)} records for {rate_name}")
             if len(df):

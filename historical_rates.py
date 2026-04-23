@@ -83,9 +83,11 @@ class HistoricalRateFetcher:
             "Prime Rate"
         )
 
-        # If primary series fails, try alternative approaches
-        if df is None or len(df) == 0:
-            print("   Primary prime rate series failed, trying banking group...")
+        # If primary series fetch errored (None), try the banking-group
+        # fallback. An empty DataFrame means the primary responded fine but
+        # has no new observations yet — not a failure, no fallback needed.
+        if df is None:
+            print("   Primary prime rate series errored, trying banking group...")
             df = self._fetch_prime_from_banking_group(start_date, end_date)
 
         return df
@@ -134,7 +136,10 @@ class HistoricalRateFetcher:
 
             if obs_start is None:
                 print(f"   ⚠️  No data available for this date range")
-                return None
+                # Distinguish "no observations in range" (valid response, just
+                # nothing new yet today) from a real fetch error — callers use
+                # this to decide whether to try the banking-group fallback.
+                return pd.DataFrame(columns=["date", "rate"])
 
             # Get data from observations section onwards
             csv_data = StringIO('\n'.join(lines[obs_start:]))
