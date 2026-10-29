@@ -1,8 +1,9 @@
 /**
  * subscribe-proxy for the mortgage rate tracker.
  *
- * Self-hosted subscriber list (D1 `subscribers` table) plus per-day dedup
- * (D1 `sends` table). No Resend audiences used — we only touch Resend's
+ * Self-hosted subscriber list (D1 `subscribers` table) plus a daily send
+ * ledger (D1 `sends` table) that caps every address at one email per UTC day
+ * across both lists and confirmation emails. No Resend audiences used — we only touch Resend's
  * transactional /emails/batch API, so we never consume audience/segment
  * slots. Subscriber addresses never leave the Cloudflare account except at
  * send time (where Resend necessarily sees them).
@@ -24,7 +25,8 @@
  *                                     rows for lists the user unchecked.
  *   POST /broadcast                   GH Actions → worker: sends a short email
  *                                     to every confirmed subscriber for a list,
- *                                     with per-day dedup. Auth-guarded.
+ *                                     skipping anyone already emailed today
+ *                                     (either list). Auth-guarded.
  */
 
 export interface Env {
@@ -35,6 +37,8 @@ export interface Env {
   CONFIRMATION_SENT_URL: string;
   BLOCKED_URL: string;
   UNSUBSCRIBED_URL: string;
+  DAILY_LIMIT_URL?: string;
+  RESEND_BASE_URL?: string;
   SUCCESS_URL_CA: string;
   SUCCESS_URL_US: string;
   ERROR_URL?: string;
@@ -166,6 +170,11 @@ function resolveUrl(env: Env, base: string, list: string): string {
   return typeof fallback === "string" ? fallback : "";
 }
 
+// Overridable only so local tests can point at a mock server.
+function resendBase(env: Env): string {
+  return (env.RESEND_BASE_URL || "https://api.resend.com").replace(/\/$/, "");
+}
+
 function generateToken(): string {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
@@ -185,6 +194,32 @@ function safeEqual(a: string, b: string): boolean {
 
 function utcDateStr(d: Date = new Date()): string {
   return d.toISOString().slice(0, 10);
+}
+
+// ---------------------------------------------------------------------------
+// Daily send ledger: no address gets more than one email per UTC day, from
+// any path (broadcast on either list, or a confirmation email). Every send
+// claims the day first and only proceeds if the claim succeeds.
+// ---------------------------------------------------------------------------
+const CONFIRM_LEDGER_LIST = "confirm";
+
+async function claimDailySlot(env: Env, email: string, list: string, day: string): Promise<boolean> {
+  // The explicit check covers a database where the one-per-day unique index
+  // (schema.sql) has not been applied yet. The index makes the claim atomic.
+  const existing = await env.AUDIT_DB.prepare(
+    `SELECT 1 FROM sends WHERE email = ? AND date_sent = ? LIMIT 1`,
+  ).bind(email, day).first();
+  if (existing) return false;
+  const result = await env.AUDIT_DB.prepare(
+    `INSERT OR IGNORE INTO sends (email, list, date_sent) VALUES (?, ?, ?)`,
+  ).bind(email, list, day).run();
+  return ((result.meta && (result.meta.changes ?? 0)) || 0) > 0;
+}
+
+async function releaseDailySlot(env: Env, email: string, list: string, day: string): Promise<void> {
+  await env.AUDIT_DB.prepare(
+    `DELETE FROM sends WHERE email = ? AND list = ? AND date_sent = ?`,
+  ).bind(email, list, day).run();
 }
 
 function formatListLabels(lists: string[]): string {
@@ -274,7 +309,7 @@ async function sendConfirmationEmail(
     html: fillTemplate(CONFIRMATION_TEMPLATE.html, varsHtml),
     text: fillTemplate(CONFIRMATION_TEMPLATE.text, varsText),
   };
-  const resp = await fetch("https://api.resend.com/emails", {
+  const resp = await fetch(`${resendBase(env)}/emails`, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${env.RESEND_API_KEY}`,
@@ -323,6 +358,17 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
     return respondRedirect(req, confirmationSentUrl, "Already pending", true);
   }
 
+  // The confirmation email counts toward the one-email-per-day limit, so an
+  // address that already got a rate email (or a confirmation) today waits.
+  const today = utcDateStr();
+  if (!(await claimDailySlot(env, parsed.email, CONFIRM_LEDGER_LIST, today))) {
+    await logEvent(env, req, "subscribe_attempt", "daily_limit", {
+      email: parsed.email, list: parsed.lists.join(","),
+    });
+    const dailyLimitUrl = resolveUrl(env, "DAILY_LIMIT_URL", primaryList) || confirmationSentUrl;
+    return respondRedirect(req, dailyLimitUrl, "Daily email limit reached, try again tomorrow", false);
+  }
+
   const token = generateToken();
   const tokenPrefix = token.slice(0, 8);
   const record = JSON.stringify({
@@ -339,6 +385,7 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
 
   const sent = await sendConfirmationEmail(env, parsed.email, confirmUrl, blockUrl, parsed.lists);
   if (!sent) {
+    await releaseDailySlot(env, parsed.email, CONFIRM_LEDGER_LIST, today);
     await logEvent(env, req, "subscribe_attempt", "send_failed", {
       email: parsed.email, list: parsed.lists.join(","), tokenPrefix,
     });
@@ -478,40 +525,49 @@ async function handleBlock(req: Request, env: Env): Promise<Response> {
 // ---------------------------------------------------------------------------
 async function handleUnsubscribe(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
-  const token = url.searchParams.get("token") || "";
-  const tokenPrefix = token.slice(0, 8) || null;
+  // One token per list. A combined email's link carries one for each list
+  // it covers, so one click leaves all of them.
+  const tokens = url.searchParams.getAll("token").slice(0, VALID_LISTS.size);
   const okResponse = () =>
     req.method === "POST"
       ? new Response("ok", { status: 200 })
       : Response.redirect(env.UNSUBSCRIBED_URL, 303);
 
-  if (!TOKEN_RE.test(token)) {
-    await logEvent(env, req, "unsubscribe_attempt", "bad_token", { tokenPrefix });
+  if (tokens.length === 0) {
+    await logEvent(env, req, "unsubscribe_attempt", "bad_token", { tokenPrefix: null });
     return okResponse();
   }
 
-  const row = await env.AUDIT_DB.prepare(
-    `SELECT email, list FROM subscribers WHERE unsub_token = ? LIMIT 1`,
-  ).bind(token).first<{ email: string; list: string }>();
+  for (const token of tokens) {
+    const tokenPrefix = token.slice(0, 8) || null;
+    if (!TOKEN_RE.test(token)) {
+      await logEvent(env, req, "unsubscribe_attempt", "bad_token", { tokenPrefix });
+      continue;
+    }
 
-  if (!row) {
-    await logEvent(env, req, "unsubscribe_attempt", "not_found", { tokenPrefix });
-    return okResponse();
+    const row = await env.AUDIT_DB.prepare(
+      `SELECT email, list FROM subscribers WHERE unsub_token = ? LIMIT 1`,
+    ).bind(token).first<{ email: string; list: string }>();
+
+    if (!row) {
+      await logEvent(env, req, "unsubscribe_attempt", "not_found", { tokenPrefix });
+      continue;
+    }
+
+    try {
+      await env.AUDIT_DB.prepare(`DELETE FROM subscribers WHERE unsub_token = ?`)
+        .bind(token).run();
+      // Only blocks future subscribe attempts for THIS address if they also
+      // requested a hard block. A per-list unsubscribe should not nuke their
+      // other subscriptions, so we don't write to the block: KV here.
+    } catch (e) {
+      console.error("unsubscribe failed:", e);
+    }
+
+    await logEvent(env, req, "unsubscribe_attempt", "unsubscribed", {
+      email: row.email, list: row.list, tokenPrefix,
+    });
   }
-
-  try {
-    await env.AUDIT_DB.prepare(`DELETE FROM subscribers WHERE unsub_token = ?`)
-      .bind(token).run();
-    // Only blocks future subscribe attempts for THIS address if they also
-    // requested a hard block. A per-list unsubscribe should not nuke their
-    // other subscriptions — so we don't write to the block: KV here.
-  } catch (e) {
-    console.error("unsubscribe failed:", e);
-  }
-
-  await logEvent(env, req, "unsubscribe_attempt", "unsubscribed", {
-    email: row.email, list: row.list, tokenPrefix,
-  });
 
   return okResponse();
 }
@@ -692,23 +748,133 @@ async function handlePostPreferences(req: Request, env: Env): Promise<Response> 
 }
 
 // ---------------------------------------------------------------------------
-// POST /broadcast  — fan-out to all confirmed subscribers of one list
+// Rate emails: shared types and helpers for /broadcast and /flush
 // ---------------------------------------------------------------------------
-interface BroadcastRequest {
-  list: string;
+interface Message {
   subject: string;
   html: string;
   text: string;
 }
 
-async function handleBroadcast(req: Request, env: Env): Promise<Response> {
+// New shape: `messages` keyed by a lists key ('ca', 'us', 'ca+us'). The old
+// single-list shape ({list, subject, html, text}) is still accepted.
+interface BroadcastRequest {
+  messages?: Record<string, Message>;
+  list?: string;
+  subject?: string;
+  html?: string;
+  text?: string;
+}
+
+interface Envelope {
+  email: string;
+  key: string;
+  payload: Record<string, unknown>;
+}
+
+function listsKey(lists: string[]): string {
+  return Array.from(new Set(lists)).sort().join("+");
+}
+
+function parseListsKey(key: string): string[] | null {
+  const parts = key.split("+");
+  if (parts.length === 0 || parts.some((p) => !VALID_LISTS.has(p))) return null;
+  return listsKey(parts) === key ? parts : null;
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status, headers: { "Content-Type": "application/json" },
+  });
+}
+
+function authorized(req: Request, env: Env): boolean {
   const auth = req.headers.get("authorization") || "";
-  const expected = `Bearer ${env.BROADCAST_AUTH_KEY}`;
-  if (!env.BROADCAST_AUTH_KEY || !safeEqual(auth, expected)) {
+  return !!env.BROADCAST_AUTH_KEY && safeEqual(auth, `Bearer ${env.BROADCAST_AUTH_KEY}`);
+}
+
+// list -> unsub_token for every list this address is subscribed to.
+async function subscriptionTokens(env: Env, email: string): Promise<Record<string, string>> {
+  const rows = await env.AUDIT_DB.prepare(
+    `SELECT list, unsub_token FROM subscribers WHERE email = ?`,
+  ).bind(email).all<{ list: string; unsub_token: string }>();
+  const out: Record<string, string> = {};
+  for (const r of rows.results || []) out[r.list] = r.unsub_token;
+  return out;
+}
+
+// Personalize a message. A combined email's unsubscribe link carries one
+// token per list it covers, so one click leaves every one of them.
+function buildEnvelope(env: Env, origin: string, email: string, key: string,
+                       msg: Message, tokens: string[]): Envelope {
+  const unsubUrl = `${origin}/unsubscribe?` + tokens.map((t) => `token=${t}`).join("&");
+  const prefsUrl = `${origin}/preferences?token=${tokens[0]}`;
+  const fill = (s: string) => s.replace(/{{UNSUB_URL}}/g, unsubUrl).replace(/{{PREFS_URL}}/g, prefsUrl);
+  return {
+    email,
+    key,
+    payload: {
+      from: env.FROM_ADDR,
+      to: [email],
+      subject: msg.subject,
+      html: fill(msg.html),
+      text: fill(msg.text),
+      headers: {
+        "List-Unsubscribe": `<${unsubUrl}>`,
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+      },
+    },
+  };
+}
+
+// Send already-claimed envelopes in Resend batches. Failed batches release
+// their daily slots so a later attempt can go out. Returns the envelopes
+// that were delivered.
+async function deliver(env: Env, req: Request, day: string, envelopes: Envelope[],
+                       event: string): Promise<{ delivered: Envelope[]; failed: number }> {
+  const delivered: Envelope[] = [];
+  let failed = 0;
+  for (let i = 0; i < envelopes.length; i += RESEND_BATCH_CHUNK) {
+    const chunk = envelopes.slice(i, i + RESEND_BATCH_CHUNK);
+    let ok = false;
+    try {
+      const resp = await fetch(`${resendBase(env)}/emails/batch`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${env.RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(chunk.map((e) => e.payload)),
+      });
+      ok = resp.status >= 200 && resp.status < 300;
+      if (!ok) await logEvent(env, req, event, "resend_error");
+    } catch (e) {
+      console.error("resend batch failed:", e);
+      await logEvent(env, req, event, "fetch_error");
+    }
+    if (ok) {
+      delivered.push(...chunk);
+      await logEvent(env, req, event, "sent_chunk");
+    } else {
+      failed += chunk.length;
+      for (const e of chunk) await releaseDailySlot(env, e.email, e.key, day);
+    }
+  }
+  return { delivered, failed };
+}
+
+// ---------------------------------------------------------------------------
+// POST /broadcast  — fan-out of one or more lists' messages
+// ---------------------------------------------------------------------------
+// Each subscriber gets exactly one email: the message for the set of changed
+// lists they are on (the combined 'ca+us' one if they are on both). Anyone
+// who already got an email today is held back in `deferred` and sent by
+// /flush on a later day, so nobody misses a change and nobody gets two
+// emails in a day.
+async function handleBroadcast(req: Request, env: Env): Promise<Response> {
+  if (!authorized(req, env)) {
     await logEvent(env, req, "broadcast_attempt", "bad_auth");
-    return new Response(JSON.stringify({ error: "forbidden" }), {
-      status: 403, headers: { "Content-Type": "application/json" },
-    });
+    return jsonResponse({ error: "forbidden" }, 403);
   }
 
   let body: BroadcastRequest;
@@ -716,112 +882,111 @@ async function handleBroadcast(req: Request, env: Env): Promise<Response> {
     body = await req.json() as BroadcastRequest;
   } catch {
     await logEvent(env, req, "broadcast_attempt", "bad_body");
-    return new Response(JSON.stringify({ error: "bad_body" }), {
-      status: 400, headers: { "Content-Type": "application/json" },
-    });
+    return jsonResponse({ error: "bad_body" }, 400);
   }
 
-  const list = (body.list || "").toLowerCase();
-  if (!VALID_LISTS.has(list)) {
-    await logEvent(env, req, "broadcast_attempt", "bad_list", { list });
-    return new Response(JSON.stringify({ error: "bad_list" }), {
-      status: 400, headers: { "Content-Type": "application/json" },
-    });
+  const messages: Record<string, Message> = body.messages
+    ?? (body.list ? { [body.list.toLowerCase()]: body as Message } : {});
+  const keys = Object.keys(messages);
+  if (keys.length === 0 || keys.some((k) => !parseListsKey(k))) {
+    await logEvent(env, req, "broadcast_attempt", "bad_list", { list: keys.join(",") });
+    return jsonResponse({ error: "bad_list" }, 400);
   }
-  if (!body.subject || !body.html || !body.text) {
-    await logEvent(env, req, "broadcast_attempt", "missing_content", { list });
-    return new Response(JSON.stringify({ error: "missing_content" }), {
-      status: 400, headers: { "Content-Type": "application/json" },
-    });
+  if (keys.some((k) => !messages[k].subject || !messages[k].html || !messages[k].text)) {
+    await logEvent(env, req, "broadcast_attempt", "missing_content", { list: keys.join(",") });
+    return jsonResponse({ error: "missing_content" }, 400);
   }
 
-  const workerOrigin = new URL(req.url).origin;
+  const changedLists = Array.from(new Set(keys.flatMap((k) => parseListsKey(k)!)));
+  const origin = new URL(req.url).origin;
   const today = utcDateStr();
+  const logList = keys.join(",");
 
+  // email -> (list -> unsub_token), restricted to the changed lists.
   const rows = await env.AUDIT_DB.prepare(
-    `SELECT email, unsub_token FROM subscribers WHERE list = ?`,
-  ).bind(list).all<{ email: string; unsub_token: string }>();
-  const candidates = rows.results || [];
-
-  let sent = 0, skippedDedup = 0, failed = 0;
-
-  const accepted: { email: string; unsub_token: string }[] = [];
-  for (const row of candidates) {
-    const result = await env.AUDIT_DB.prepare(
-      `INSERT OR IGNORE INTO sends (email, list, date_sent) VALUES (?, ?, ?)`,
-    ).bind(row.email, list, today).run();
-    const changes = (result.meta && (result.meta.changes ?? 0)) || 0;
-    if (changes > 0) accepted.push(row);
-    else skippedDedup++;
+    `SELECT email, list, unsub_token FROM subscribers
+     WHERE list IN (${changedLists.map(() => "?").join(",")})`,
+  ).bind(...changedLists).all<{ email: string; list: string; unsub_token: string }>();
+  const byEmail = new Map<string, Record<string, string>>();
+  for (const r of rows.results || []) {
+    byEmail.set(r.email, { ...(byEmail.get(r.email) || {}), [r.list]: r.unsub_token });
   }
 
-  if (accepted.length === 0) {
-    await logEvent(env, req, "broadcast_attempt", "nothing_to_send", { list });
-    return new Response(
-      JSON.stringify({ sent: 0, skipped_dedup: skippedDedup, failed: 0 }),
-      { status: 200, headers: { "Content-Type": "application/json" } },
-    );
-  }
-
-  for (let i = 0; i < accepted.length; i += RESEND_BATCH_CHUNK) {
-    const chunk = accepted.slice(i, i + RESEND_BATCH_CHUNK);
-    const envelopes = chunk.map((row) => {
-      const unsubUrl = `${workerOrigin}/unsubscribe?token=${row.unsub_token}`;
-      const prefsUrl = `${workerOrigin}/preferences?token=${row.unsub_token}`;
-      return {
-        from: env.FROM_ADDR,
-        to: [row.email],
-        subject: body.subject,
-        html: body.html
-          .replace(/{{UNSUB_URL}}/g, unsubUrl)
-          .replace(/{{PREFS_URL}}/g, prefsUrl),
-        text: body.text
-          .replace(/{{UNSUB_URL}}/g, unsubUrl)
-          .replace(/{{PREFS_URL}}/g, prefsUrl),
-        headers: {
-          "List-Unsubscribe": `<${unsubUrl}>`,
-          "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
-        },
-      };
-    });
-
-    try {
-      const resp = await fetch("https://api.resend.com/emails/batch", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${env.RESEND_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(envelopes),
-      });
-      if (resp.status >= 200 && resp.status < 300) {
-        sent += chunk.length;
-        await logEvent(env, req, "broadcast_attempt", "sent_chunk", { list });
-      } else {
-        failed += chunk.length;
-        for (const row of chunk) {
-          await env.AUDIT_DB.prepare(
-            `DELETE FROM sends WHERE email = ? AND list = ? AND date_sent = ?`,
-          ).bind(row.email, list, today).run();
-        }
-        await logEvent(env, req, "broadcast_attempt", "resend_error", { list });
-      }
-    } catch (e) {
-      console.error("resend batch failed:", e);
-      failed += chunk.length;
-      for (const row of chunk) {
-        await env.AUDIT_DB.prepare(
-          `DELETE FROM sends WHERE email = ? AND list = ? AND date_sent = ?`,
-        ).bind(row.email, list, today).run();
-      }
-      await logEvent(env, req, "broadcast_attempt", "fetch_error", { list });
+  const envelopes: Envelope[] = [];
+  let deferred = 0;
+  for (const [email, tokens] of byEmail) {
+    const subscribed = Object.keys(tokens);
+    // Prefer the exact combined message; fall back to one list's message
+    // only if the caller did not send a combined one.
+    const key = messages[listsKey(subscribed)] ? listsKey(subscribed)
+      : subscribed.find((l) => messages[l])!;
+    const msg = messages[key];
+    if (await claimDailySlot(env, email, key, today)) {
+      envelopes.push(buildEnvelope(env, origin, email, key, msg, parseListsKey(key)!.map((l) => tokens[l])));
+    } else {
+      // Newer news for the same lists replaces anything already held back.
+      await env.AUDIT_DB.prepare(
+        `INSERT OR REPLACE INTO deferred (email, lists, subject, html, text, created_day)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).bind(email, key, msg.subject, msg.html, msg.text, today).run();
+      deferred++;
     }
   }
 
-  return new Response(
-    JSON.stringify({ sent, skipped_dedup: skippedDedup, failed }),
-    { status: 200, headers: { "Content-Type": "application/json" } },
-  );
+  if (envelopes.length === 0) {
+    await logEvent(env, req, "broadcast_attempt", "nothing_to_send", { list: logList });
+    return jsonResponse({ sent: 0, deferred, failed: 0 });
+  }
+
+  const { delivered, failed } = await deliver(env, req, today, envelopes, "broadcast_attempt");
+  return jsonResponse({ sent: delivered.length, deferred, failed });
+}
+
+// ---------------------------------------------------------------------------
+// POST /flush  — send emails held back by the daily limit on earlier days
+// ---------------------------------------------------------------------------
+// Called by the GitHub Actions pipeline on every run. Sends at most one held
+// email per address per day (the oldest first). A held email is dropped if
+// the address has since left any list it covers.
+async function handleFlush(req: Request, env: Env): Promise<Response> {
+  if (!authorized(req, env)) {
+    await logEvent(env, req, "flush_attempt", "bad_auth");
+    return jsonResponse({ error: "forbidden" }, 403);
+  }
+
+  const today = utcDateStr();
+  const origin = new URL(req.url).origin;
+  const rows = await env.AUDIT_DB.prepare(
+    `SELECT id, email, lists, subject, html, text FROM deferred
+     WHERE created_day < ? ORDER BY id`,
+  ).bind(today).all<{ id: number; email: string; lists: string; subject: string; html: string; text: string }>();
+
+  const seen = new Set<string>();
+  const envelopes: Envelope[] = [];
+  const idsByEnvelope = new Map<Envelope, number>();
+  let dropped = 0, deferred = 0;
+  for (const row of rows.results || []) {
+    if (seen.has(row.email)) { deferred++; continue; }
+    seen.add(row.email);
+    const lists = parseListsKey(row.lists);
+    const tokens = await subscriptionTokens(env, row.email);
+    if (!lists || lists.some((l) => !tokens[l])) {
+      await env.AUDIT_DB.prepare(`DELETE FROM deferred WHERE id = ?`).bind(row.id).run();
+      dropped++;
+      continue;
+    }
+    if (!(await claimDailySlot(env, row.email, row.lists, today))) { deferred++; continue; }
+    const envelope = buildEnvelope(env, origin, row.email, row.lists, row, lists.map((l) => tokens[l]));
+    envelopes.push(envelope);
+    idsByEnvelope.set(envelope, row.id);
+  }
+
+  const { delivered, failed } = await deliver(env, req, today, envelopes, "flush_attempt");
+  for (const e of delivered) {
+    await env.AUDIT_DB.prepare(`DELETE FROM deferred WHERE id = ?`).bind(idsByEnvelope.get(e)!).run();
+  }
+  if (envelopes.length === 0) await logEvent(env, req, "flush_attempt", "nothing_to_send");
+  return jsonResponse({ sent: delivered.length, deferred, dropped, failed });
 }
 
 // ---------------------------------------------------------------------------
@@ -839,6 +1004,7 @@ export default {
     if (req.method === "GET"  && url.pathname === "/preferences") return handleGetPreferences(req, env);
     if (req.method === "POST" && url.pathname === "/preferences") return handlePostPreferences(req, env);
     if (req.method === "POST" && url.pathname === "/broadcast") return handleBroadcast(req, env);
+    if (req.method === "POST" && url.pathname === "/flush") return handleFlush(req, env);
     return new Response("Not Found", { status: 404 });
   },
 };

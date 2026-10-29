@@ -1,18 +1,21 @@
 """
 Rate-change email sender.
 
-Change-detection strategy, per region:
+Change-detection strategy, per region (series and CSVs are defined in rates.py):
 
-  ca -> data/boc_policy_rate.csv            (BoC policy rate)
-  us -> data/us_fed_target_upper.csv        (FOMC target rate upper bound,
-                                             FRED series DFEDTARU)
+  ca -> ca/policy   (BoC target for the overnight rate, Valet V39079)
+  us -> us/target   (FOMC target rate, upper bound since 2008, FRED DFEDTARU)
 
 The mortgage prime rate for each region is shown inside the email as context
 (same-date value + a typical-lag note), but is NOT what triggers a send.
 
-When a new change is detected, an email payload is POSTed to the subscribe
-proxy's /broadcast endpoint, which fans out to every confirmed subscriber for
-that region. Per-day dedup is enforced server-side.
+All regions are checked first, then every new change goes out in a single
+POST to the subscribe proxy's /broadcast endpoint. The payload carries one
+message per region plus, when more than one region changed, a combined
+message ('ca+us') that the worker sends to people on every changed list.
+The worker caps every address at one email per UTC day and holds back
+anything over the cap. Each run first calls /flush, which sends held-back
+emails from earlier days.
 
 State file schema (data/rate_changes.json):
 
@@ -20,10 +23,10 @@ State file schema (data/rate_changes.json):
       "ca": {
         "series": "Bank of Canada policy rate",
         "changes": [
-          {"date": "2025-11-01", "value": 2.50},
-          {"date": "2025-09-01", "value": 2.75},
-          {"date": "2025-03-01", "value": 3.00},
-          {"date": "2025-02-01", "value": 3.25}
+          {"date": "2025-10-30", "value": 2.25},
+          {"date": "2025-09-18", "value": 2.50},
+          {"date": "2025-03-13", "value": 2.75},
+          {"date": "2025-01-30", "value": 3.00}
         ]
       },
       "us": { ... }
@@ -62,7 +65,9 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 
-DATA_DIR = Path("data")
+import rates
+
+DATA_DIR = rates.DATA_DIR
 STATE_PATH = DATA_DIR / "rate_changes.json"
 LAG_CACHE_PATH = DATA_DIR / "prime_lag.json"
 HISTORY_LENGTH = 4
@@ -75,8 +80,8 @@ REGIONS: Dict[str, Dict[str, str]] = {
     "ca": {
         "label":            "Bank of Canada policy rate",
         "central_bank":     "Bank of Canada",
-        "trigger_csv":      str(DATA_DIR / "boc_policy_rate.csv"),
-        "prime_csv":        str(DATA_DIR / "commercial_prime_rate.csv"),
+        "trigger_csv":      str(rates.get("ca", "policy").csv),
+        "prime_csv":        str(rates.get("ca", "prime").csv),
         "prime_label":      "Canadian mortgage prime rate",
         "page_path":        "/ca/",
         "subscriber_label": "Canadian rate updates",
@@ -85,8 +90,8 @@ REGIONS: Dict[str, Dict[str, str]] = {
     "us": {
         "label":            "Fed target rate (upper bound)",
         "central_bank":     "Federal Reserve",
-        "trigger_csv":      str(DATA_DIR / "us_fed_target_upper.csv"),
-        "prime_csv":        str(DATA_DIR / "us_prime_rate.csv"),
+        "trigger_csv":      str(rates.get("us", "target").csv),
+        "prime_csv":        str(rates.get("us", "prime").csv),
         "prime_label":      "US mortgage prime rate",
         "page_path":        "/us/",
         "subscriber_label": "US rate updates",
@@ -204,11 +209,13 @@ def compute_prime_lag_days(policy_csv: Path, prime_csv: Path,
 
     lags: List[int] = []
     for pd_ in policy_dates:
-        next_prime = [d for d in prime_dates if d > pd_]
+        # Prime usually moves the same day the policy change takes effect, so
+        # a same-date prime transition counts (lag 0).
+        next_prime = [d for d in prime_dates if d >= pd_]
         if not next_prime:
             continue
         lag = (next_prime[0] - pd_).days
-        if 0 < lag <= max_gap:
+        if lag <= max_gap:
             lags.append(lag)
     if not lags:
         return None
@@ -317,16 +324,25 @@ def _fmt_signed_pct(x: Optional[float]) -> str:
     return f"{sign}{abs(x):.2f}%"
 
 
+def _lag_note(lag_days: Optional[int]) -> str:
+    if lag_days is None:
+        return ""
+    if lag_days == 0:
+        return " Prime rate typically changes the same day."
+    return f" Prime rate typically follows within about {lag_days} days."
+
+
 def _fmt_days(d: Optional[int]) -> str:
     return "—" if d is None else str(d)
 
 
-def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[str, str]:
-    """Build subject, markdown, html, and text for a broadcast.
+SUPPORT_URL = "https://k1monfared.github.io/sponsor.html"
+REGION_HEADINGS = {"ca": "Canada", "us": "United States"}
 
-    `{{UNSUB_URL}}` / `{{PREFS_URL}}` placeholders are substituted by the
-    worker per recipient.
-    """
+
+def _region_body(region_slug: str, history: List[Dict], base_url: str) -> Dict[str, str]:
+    """Subject plus the body of one region's update (no title, no footer),
+    as markdown, html and text, so it can stand alone or be combined."""
     cfg = REGIONS[region_slug]
     prime_csv = Path(cfg["prime_csv"])
 
@@ -339,102 +355,50 @@ def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[
     if len(history) >= 2:
         prev_val = float(history[1]["value"])
         direction = direction_word(newest_val, prev_val)
-        delta = abs(newest_val - prev_val)
-        delta_str = f"{delta:.2f}%"
+        delta_str = f"{abs(newest_val - prev_val):.2f}%"
     else:
         direction = "changed to"
-        prev_val = None
         delta_str = None
 
-    # Prime context at the change date.
+    # Prime rate as of the change date, falling back to the most recent prime
+    # observation if there is nothing on or before the change date.
     prime_at_change = prime_on_date(prime_csv, newest["date"])
-    prime_now, _ = current_prime(prime_csv)
-    # Value to display in the lede: prime rate as of the change date. Falls
-    # back to the most recent prime observation if we have nothing on/before
-    # the change date.
-    prime_lede = prime_at_change if prime_at_change is not None else prime_now
-    # Read from the cached lag (refreshed whenever a change is detected by
-    # process_region or refresh_lag_for_region). Never recompute here.
-    lag_days = cached_lag_days(region_slug)
+    prime_lede = prime_at_change if prime_at_change is not None else current_prime(prime_csv)[0]
+    # Read from the cached lag (refreshed whenever a change is detected).
+    lag_note = _lag_note(cached_lag_days(region_slug))
 
     rows = _enriched_history(history, Path(cfg["trigger_csv"]), prime_csv)
-
     subject = f"{cfg['subject_prefix']} {direction} to {rate_pct}"
 
-    # --- Markdown (the canonical human-readable copy) ----------------------
-    md_lines: List[str] = []
-    md_lines.append(f"# {subject}")
-    md_lines.append("")
     if delta_str:
-        md_lines.append(
-            f"The **{cfg['label']}** {direction} to **{rate_pct}** "
-            f"on {newest['date']} by {delta_str}."
-        )
+        lede = (f"The **{cfg['label']}** {direction} to **{rate_pct}** "
+                f"on {newest['date']} by {delta_str}.")
     else:
-        md_lines.append(
-            f"The **{cfg['label']}** is now **{rate_pct}** as of {newest['date']}."
-        )
-    md_lines.append("")
-    if prime_lede is not None:
-        lag_note = (
-            f" Prime rate typically follows within about {lag_days} days."
-            if lag_days else ""
-        )
-        md_lines.append(
-            f"The **{cfg['prime_label']}** is **{prime_lede:.2f}%**.{lag_note}"
-        )
-        md_lines.append("")
-    md_lines.append("**Recent history**")
-    md_lines.append("")
-    md_lines.append(
-        f"| Date       | {cfg['label']} | {cfg['prime_label']} (same date) | "
-        f"Days since last | Change |"
-    )
-    md_lines.append("| ---------- | ---: | ---: | ---: | ---: |")
+        lede = f"The **{cfg['label']}** is now **{rate_pct}** as of {newest['date']}."
+    prime_line = (f"The **{cfg['prime_label']}** is **{prime_lede:.2f}%**.{lag_note}"
+                  if prime_lede is not None else None)
+
+    def bold_html(s: str) -> str:
+        parts = s.split("**")
+        return "".join(f"<strong>{p}</strong>" if i % 2 else p for i, p in enumerate(parts))
+
+    # --- Markdown ----------------------------------------------------------
+    md = [lede, ""]
+    if prime_line:
+        md += [prime_line, ""]
+    md += [
+        "**Recent history**",
+        "",
+        f"| Date       | {cfg['label']} | {cfg['prime_label']} (same date) | Days since last | Change |",
+        "| ---------- | ---: | ---: | ---: | ---: |",
+    ]
     for r in rows:
         prime_cell = f"{r['prime']:.2f}%" if r["prime"] is not None else "—"
-        md_lines.append(
-            f"| {r['date']} | {r['value']:.2f}% | {prime_cell} | "
-            f"{_fmt_days(r['days_since_last'])} | {_fmt_signed_pct(r['delta'])} |"
-        )
-    md_lines.append("")
-    md_lines.append(f"[View the full chart]({page_url})")
-    md_lines.append("")
-    md_lines.append("---")
-    md_lines.append("")
-    md_lines.append(
-        f"You are receiving this because you subscribed to {cfg['subscriber_label']}."
-    )
-    md_lines.append(
-        "[Unsubscribe from this list]({{UNSUB_URL}}) · "
-        "[Manage preferences]({{PREFS_URL}}) · "
-        "[Support](https://k1monfared.github.io/sponsor.html)"
-    )
-    markdown = "\n".join(md_lines) + "\n"
+        md.append(f"| {r['date']} | {r['value']:.2f}% | {prime_cell} | "
+                  f"{_fmt_days(r['days_since_last'])} | {_fmt_signed_pct(r['delta'])} |")
+    md += ["", f"[View the full chart]({page_url})"]
 
     # --- HTML --------------------------------------------------------------
-    if delta_str:
-        lede_html = (
-            f"<p>The <strong>{cfg['label']}</strong> {direction} to "
-            f"<strong>{rate_pct}</strong> on {newest['date']} by {delta_str}.</p>"
-        )
-    else:
-        lede_html = (
-            f"<p>The <strong>{cfg['label']}</strong> is now "
-            f"<strong>{rate_pct}</strong> as of {newest['date']}.</p>"
-        )
-    if prime_lede is not None:
-        lag_note_html = (
-            f" Prime rate typically follows within about {lag_days} days."
-            if lag_days else ""
-        )
-        prime_html = (
-            f"<p>The <strong>{cfg['prime_label']}</strong> is "
-            f"<strong>{prime_lede:.2f}%</strong>.{lag_note_html}</p>"
-        )
-    else:
-        prime_html = ""
-
     def _html_row(r: Dict) -> str:
         prime_cell = f"{r['prime']:.2f}%" if r["prime"] is not None else "—"
         return (
@@ -445,130 +409,173 @@ def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[
             f"<td style=\"text-align:right;\">{_fmt_signed_pct(r['delta'])}</td>"
             f"</tr>"
         )
-    table_rows_html = "".join(_html_row(r) for r in rows)
-    table_html = (
-        "<p><strong>Recent history</strong></p>"
+    html = (
+        f"<p>{bold_html(lede)}</p>\n"
+        + (f"<p>{bold_html(prime_line)}</p>\n" if prime_line else "")
+        + "<p><strong>Recent history</strong></p>"
         "<table role=\"presentation\" cellpadding=\"6\" cellspacing=\"0\" "
         "style=\"border-collapse:collapse;margin:4px 0 12px;font-size:14px;\">"
         "<thead><tr>"
-        f"<th style=\"text-align:left;border-bottom:1px solid #ddd;\">Date</th>"
+        "<th style=\"text-align:left;border-bottom:1px solid #ddd;\">Date</th>"
         f"<th style=\"text-align:right;border-bottom:1px solid #ddd;\">{cfg['label']}</th>"
         f"<th style=\"text-align:right;border-bottom:1px solid #ddd;\">{cfg['prime_label']}<br>(same date)</th>"
-        f"<th style=\"text-align:right;border-bottom:1px solid #ddd;\">Days since last</th>"
-        f"<th style=\"text-align:right;border-bottom:1px solid #ddd;\">Change</th>"
+        "<th style=\"text-align:right;border-bottom:1px solid #ddd;\">Days since last</th>"
+        "<th style=\"text-align:right;border-bottom:1px solid #ddd;\">Change</th>"
         "</tr></thead>"
-        f"<tbody>{table_rows_html}</tbody>"
-        "</table>"
+        f"<tbody>{''.join(_html_row(r) for r in rows)}</tbody>"
+        "</table>\n"
+        f"<p><a href=\"{page_url}\" style=\"color:#0b5394;\">View the full chart</a></p>"
     )
 
+    # --- Plain text --------------------------------------------------------
+    text = [lede.replace("**", "")]
+    if prime_line:
+        text.append(prime_line.replace("**", ""))
+    text += ["", "Recent history:", "  date        policy   prime   days  change"]
+    for r in rows:
+        prime_cell = f"{r['prime']:.2f}%" if r["prime"] is not None else "   — "
+        text.append(f"  {r['date']}  {r['value']:5.2f}%  {prime_cell:>6}  "
+                    f"{_fmt_days(r['days_since_last']).rjust(4)}  {_fmt_signed_pct(r['delta'])}")
+    text += ["", f"View the full chart: {page_url}"]
+
+    return {"subject": subject, "markdown": "\n".join(md), "html": html, "text": "\n".join(text)}
+
+
+def _assemble(subject: str, sections: List[Dict[str, str]], subscriber_label: str,
+              unsub_label: str) -> Dict[str, str]:
+    """Wrap one or more region bodies with the title and footer.
+
+    `{{UNSUB_URL}}` / `{{PREFS_URL}}` placeholders are substituted by the
+    worker per recipient. For a combined email the worker's UNSUB_URL
+    unsubscribes from every list the email covers.
+    """
+    md =[f"# {subject}", ""]
+    for s in sections:
+        if s.get("heading"):
+            md += [f"## {s['heading']}", ""]
+        md += [s["markdown"], ""]
+    md += [
+        "---", "",
+        f"You are receiving this because you subscribed to {subscriber_label}.",
+        f"[{unsub_label}]({{{{UNSUB_URL}}}}) · [Manage preferences]({{{{PREFS_URL}}}}) · "
+        f"[Support]({SUPPORT_URL})",
+    ]
+
+    body_html = "\n".join(
+        (f"<h2 style=\"font-size:17px;margin:20px 0 6px;\">{s['heading']}</h2>\n" if s.get("heading") else "")
+        + s["html"] for s in sections
+    )
     html = f"""<!DOCTYPE html>
 <html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#222;line-height:1.55;max-width:560px;margin:0 auto;padding:24px;">
-{lede_html}
-{prime_html}
-{table_html}
-<p><a href="{page_url}" style="color:#0b5394;">View the full chart</a></p>
+{body_html}
 <hr style="margin:24px 0;border:none;border-top:1px solid #ddd;">
 <p style="font-size:12px;color:#666;">
-  You are receiving this because you subscribed to {cfg['subscriber_label']}.
-  <a href="{{{{UNSUB_URL}}}}" style="color:#666;">Unsubscribe from this list</a>
+  You are receiving this because you subscribed to {subscriber_label}.
+  <a href="{{{{UNSUB_URL}}}}" style="color:#666;">{unsub_label}</a>
   &middot; <a href="{{{{PREFS_URL}}}}" style="color:#666;">Manage preferences</a>
-  &middot; <a href="https://k1monfared.github.io/sponsor.html" style="color:#666;">Support</a>
+  &middot; <a href="{SUPPORT_URL}" style="color:#666;">Support</a>
 </p>
 </body></html>"""
 
-    # --- Plain text --------------------------------------------------------
-    text_lines: List[str] = []
-    if delta_str:
-        text_lines.append(
-            f"The {cfg['label']} {direction} to {rate_pct} "
-            f"on {newest['date']} by {delta_str}."
-        )
-    else:
-        text_lines.append(f"The {cfg['label']} is now {rate_pct} as of {newest['date']}.")
-    if prime_lede is not None:
-        lag_note_txt = (
-            f" Prime rate typically follows within about {lag_days} days."
-            if lag_days else ""
-        )
-        text_lines.append(f"The {cfg['prime_label']} is {prime_lede:.2f}%.{lag_note_txt}")
-    text_lines.append("")
-    text_lines.append("Recent history:")
-    text_lines.append("  date        policy   prime   days  change")
-    for r in rows:
-        prime_cell = f"{r['prime']:.2f}%" if r["prime"] is not None else "   — "
-        days_cell  = _fmt_days(r['days_since_last']).rjust(4)
-        text_lines.append(
-            f"  {r['date']}  {r['value']:5.2f}%  {prime_cell:>6}  {days_cell}  "
-            f"{_fmt_signed_pct(r['delta'])}"
-        )
-    text_lines.append("")
-    text_lines.append(f"View the full chart: {page_url}")
-    text_lines.append("Unsubscribe from this list: {{UNSUB_URL}}")
-    text_lines.append("Manage preferences (both regions): {{PREFS_URL}}")
-    text_lines.append("Support: https://k1monfared.github.io/sponsor.html")
+    text = []
+    for s in sections:
+        if s.get("heading"):
+            text += [s["heading"].upper(), ""]
+        text += [s["text"], ""]
+    text += [
+        f"{unsub_label}: {{{{UNSUB_URL}}}}",
+        "Manage preferences (both regions): {{PREFS_URL}}",
+        f"Support: {SUPPORT_URL}",
+    ]
 
-    return {
-        "subject":  subject,
-        "html":     html,
-        "text":     "\n".join(text_lines),
-        "markdown": markdown,
-    }
+    return {"subject": subject, "html": html, "text": "\n".join(text),
+            "markdown": "\n".join(md) + "\n"}
+
+
+def compose_email(region_slug: str, history: List[Dict], base_url: str) -> Dict[str, str]:
+    """Build subject, markdown, html, and text for one region's broadcast."""
+    body = _region_body(region_slug, history, base_url)
+    return _assemble(body["subject"], [body], REGIONS[region_slug]["subscriber_label"],
+                     "Unsubscribe from this list")
+
+
+def compose_combined_email(histories: Dict[str, List[Dict]], base_url: str) -> Dict[str, str]:
+    """One email covering several regions' changes, for people subscribed to
+    all of them, so a day with two rate changes still means one email."""
+    sections = []
+    for slug, history in histories.items():
+        body = _region_body(slug, history, base_url)
+        sections.append({**body, "heading": REGION_HEADINGS[slug]})
+    subject = " and ".join(s["subject"] for s in sections)
+    labels = " and ".join(REGIONS[s]["subscriber_label"] for s in histories)
+    return _assemble(subject, sections, labels, "Unsubscribe from these lists")
 
 
 # ---------------------------------------------------------------------------
 # Dispatch via subscribe-proxy worker
 # ---------------------------------------------------------------------------
-def send_via_proxy(list_slug: str, email: Dict[str, str],
-                   proxy_url: str, auth_key: str) -> bool:
-    url = proxy_url.rstrip("/") + "/broadcast"
+def build_messages(histories: Dict[str, List[Dict]], base_url: str) -> Dict[str, Dict[str, str]]:
+    """Messages for one /broadcast call, keyed by the set of lists a recipient
+    is on ('ca', 'us', 'ca+us'). The worker gives each subscriber exactly one
+    of them: the combined one if they are on every changed list."""
+    messages = {slug: compose_email(slug, h, base_url) for slug, h in histories.items()}
+    if len(histories) > 1:
+        messages["+".join(sorted(histories))] = compose_combined_email(histories, base_url)
+    return messages
+
+
+def _post_worker(path: str, payload: Dict, proxy_url: str, auth_key: str) -> Optional[Dict]:
+    url = proxy_url.rstrip("/") + path
     try:
         resp = requests.post(
             url,
-            headers={
-                "Authorization": f"Bearer {auth_key}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "list":    list_slug,
-                "subject": email["subject"],
-                "html":    email["html"],
-                "text":    email["text"],
-            },
-            timeout=60,
+            headers={"Authorization": f"Bearer {auth_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=120,
         )
     except requests.RequestException as e:
-        print(f"  POST /broadcast failed: {e}", file=sys.stderr)
-        return False
-
+        print(f"  POST {path} failed: {e}", file=sys.stderr)
+        return None
     if not resp.ok:
-        print(f"  Worker returned {resp.status_code}: {resp.text}", file=sys.stderr)
-        return False
-
+        print(f"  Worker returned {resp.status_code} for {path}: {resp.text}", file=sys.stderr)
+        return None
     try:
         data = resp.json()
-        print(f"  Worker accepted: sent={data.get('sent', 0)}, "
-              f"skipped_dedup={data.get('skipped_dedup', 0)}, "
-              f"failed={data.get('failed', 0)}")
-    except Exception:
-        print(f"  Worker returned {resp.status_code} (non-JSON body)")
-    return True
+    except ValueError:
+        data = {}
+    print(f"  {path}: sent={data.get('sent', 0)}, deferred={data.get('deferred', 0)}, "
+          f"failed={data.get('failed', 0)}")
+    return data
+
+
+def send_via_proxy(messages: Dict[str, Dict[str, str]], proxy_url: str, auth_key: str) -> bool:
+    payload = {"messages": {k: {"subject": m["subject"], "html": m["html"], "text": m["text"]}
+                            for k, m in messages.items()}}
+    return _post_worker("/broadcast", payload, proxy_url, auth_key) is not None
+
+
+def flush_deferred(proxy_url: str, auth_key: str) -> bool:
+    """Ask the worker to send emails that the one-per-day limit held back on
+    an earlier day. Called every run, so they go out on the first run of the
+    next UTC day."""
+    return _post_worker("/flush", {}, proxy_url, auth_key) is not None
 
 
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-def process_region(slug: str, state: Dict, proxy_url: Optional[str],
-                   auth_key: Optional[str], base_url: str, dry_run: bool) -> Dict:
+def detect_region(slug: str, state: Dict) -> Tuple[Dict, bool]:
+    """Return (new state block, whether a new change was detected)."""
     cfg = REGIONS[slug]
     trigger_csv = Path(cfg["trigger_csv"])
     if not trigger_csv.exists():
-        print(f"Missing trigger CSV for {slug}: {trigger_csv} — skipping.")
-        return state.get(slug, {})
+        print(f"Missing trigger CSV for {slug}: {trigger_csv}. Skipping.")
+        return state.get(slug, {}), False
 
     latest = extract_recent_changes(trigger_csv)
     if not latest:
         print(f"No data in {trigger_csv} for {slug}.")
-        return state.get(slug, {})
+        return state.get(slug, {}), False
 
     region_block = state.get(slug, {})
     stored = region_block.get("changes", [])
@@ -581,43 +588,58 @@ def process_region(slug: str, state: Dict, proxy_url: Optional[str],
     if not stored or stored_series != cfg["label"]:
         if stored and stored_series != cfg["label"]:
             print(f"[{slug}] Stored series '{stored_series}' != configured "
-                  f"'{cfg['label']}' — reseeding history from {trigger_csv}.")
+                  f"'{cfg['label']}'. Reseeding history from {trigger_csv}.")
         else:
             print(f"[{slug}] Seeding initial history with last {len(latest)} changes.")
-        return {"series": cfg["label"], "changes": latest}
+        return {"series": cfg["label"], "changes": latest}, False
 
     merged, new_change = merge_new_change(stored, latest)
     region_block = {"series": cfg["label"], "changes": merged}
-
     if not new_change:
         print(f"[{slug}] No new change (top: {merged[0]['date']} {merged[0]['value']}%).")
-        return region_block
+        return region_block, False
 
-    newest = merged[0]
-    print(f"[{slug}] New change detected: {newest['date']} -> {newest['value']}%")
-
-    # A new change landed, so the prime-lag sample set has grown. Refresh the
-    # cached 2-year median before composing so the email reflects current data.
+    print(f"[{slug}] New change detected: {merged[0]['date']} -> {merged[0]['value']}%")
+    # The prime-lag sample set has grown. Refresh the cached 2-year median
+    # before composing so the email reflects current data.
     refresh_lag_for_region(slug)
+    return region_block, True
 
-    email = compose_email(slug, merged, base_url)
-    print(f"  subject: {email['subject']}")
-    print(f"  page:    {base_url.rstrip('/')}{cfg['page_path']}")
 
+def run_pipeline(state: Dict, proxy_url: Optional[str], auth_key: Optional[str],
+                 base_url: str, dry_run: bool) -> Dict:
+    """Detect changes for every region, then send them in one broadcast so a
+    subscriber on several changed lists gets one combined email."""
+    can_send = not dry_run and proxy_url and auth_key
     if dry_run:
-        print("  DRY_RUN=1 set — skipping actual send.")
-    elif not proxy_url or not auth_key:
-        missing = [
-            name for name, val in [
-                ("SUBSCRIBE_PROXY_URL", proxy_url),
-                ("BROADCAST_AUTH_KEY",  auth_key),
-            ] if not val
-        ]
-        print(f"  Skipping send — missing env: {', '.join(missing)}")
-    else:
-        send_via_proxy(slug, email, proxy_url, auth_key)
+        print("DRY_RUN=1 set. Nothing will be sent.")
+    elif not can_send:
+        missing = [n for n, v in [("SUBSCRIBE_PROXY_URL", proxy_url),
+                                  ("BROADCAST_AUTH_KEY", auth_key)] if not v]
+        print(f"Skipping sends. Missing env: {', '.join(missing)}")
 
-    return region_block
+    if can_send:
+        flush_deferred(proxy_url, auth_key)
+
+    previous = dict(state)
+    histories: Dict[str, List[Dict]] = {}
+    for slug in REGIONS:
+        state[slug], is_new = detect_region(slug, state)
+        if is_new:
+            histories[slug] = state[slug]["changes"]
+
+    if histories:
+        messages = build_messages(histories, base_url)
+        for key, m in messages.items():
+            print(f"  [{key}] subject: {m['subject']}")
+        if can_send and not send_via_proxy(messages, proxy_url, auth_key):
+            # Leave these changes unrecorded so the next run retries them.
+            # The worker's daily ledger stops anyone who did get the email
+            # from getting it again.
+            print(f"::error::Broadcast failed for {', '.join(histories)}. Will retry next run.")
+            for slug in histories:
+                state[slug] = previous[slug]
+    return state
 
 
 def write_draft(slug: str, base_url: str, out_path: Path) -> None:
@@ -659,9 +681,29 @@ def main(argv: Optional[List[str]] = None) -> int:
              "detection pipeline refreshes this automatically when a change "
              "lands.",
     )
+    parser.add_argument(
+        "--reseed", metavar="REGION", nargs="?", const="all",
+        help="Rewrite the stored change history for REGION (or 'all') from "
+             "its trigger CSV without sending anything, and refresh its "
+             "prime-lag cache. Use after changing a data source so the "
+             "corrected history is not mistaken for a new change.",
+    )
     args = parser.parse_args(argv)
 
     base_url  = os.environ.get("SENDER_BASE_URL", DEFAULT_BASE_URL)
+
+    if args.reseed:
+        slugs = list(REGIONS) if args.reseed == "all" else [args.reseed.lower()]
+        state = load_state()
+        for slug in slugs:
+            if slug not in REGIONS:
+                parser.error(f"Unknown region '{slug}'. Known: {', '.join(REGIONS)}.")
+            changes = extract_recent_changes(Path(REGIONS[slug]["trigger_csv"]))
+            state[slug] = {"series": REGIONS[slug]["label"], "changes": changes}
+            print(f"[{slug}] Reseeded: top {changes[0]['date']} {changes[0]['value']}%")
+            refresh_lag_for_region(slug)
+        save_state(state)
+        return 0
 
     if args.refresh_lag:
         slugs = list(REGIONS) if args.refresh_lag == "all" else [args.refresh_lag.lower()]
@@ -693,10 +735,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     auth_key  = os.environ.get("BROADCAST_AUTH_KEY")
     dry_run   = os.environ.get("DRY_RUN") == "1"
 
-    state = load_state()
-    for slug in REGIONS:
-        state[slug] = process_region(slug, state, proxy_url, auth_key, base_url, dry_run)
-
+    state = run_pipeline(load_state(), proxy_url, auth_key, base_url, dry_run)
     save_state(state)
     return 0
 

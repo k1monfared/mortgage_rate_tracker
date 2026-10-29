@@ -1,71 +1,78 @@
-# Canadian Interest Rate Tracker
+# Interest Rate Tracker (Canada and US)
 
 **Live chart:** [k1monfared.github.io/mortgage_rate_tracker](https://k1monfared.github.io/mortgage_rate_tracker/)
 
-Tracks the Bank of Canada Policy Rate and Commercial Prime Rate over time using the [BoC Valet API](https://www.bankofcanada.ca/valet/docs). The live page is rebuilt automatically every day and on every push to `master`.
+Tracks central bank policy rates and prime rates for Canada and the US, and emails subscribers when the policy rate changes. The data is refreshed and the site rebuilt every hour and on every push to `master`.
 
 ---
 
 ## Live Page
 
-The GitHub Pages site shows:
+Each region page shows:
 
-- Current BoC Policy Rate and Commercial Prime Rate (with as-of date)
-- Interactive dual-series chart going back decades — hover to inspect values, zoom/pan freely
+- The current policy rate and prime rate, each with its as-of date
+- An interactive step chart of the full history. Hover to read values, zoom and pan freely.
 
 ## Local Setup
 
 ```bash
-pip install -r requirements_boc.txt
+pip install -r requirements.txt        # site + email pipeline
+pip install -r requirements_boc.txt    # also the BoC Monitor extras
 ```
 
-No API keys required. All rate data comes from the public Bank of Canada Valet API.
+No API keys are needed. Every source is free and public.
 
 ## Scripts
 
 | Script | Purpose |
 |---|---|
-| `build_site.py` | Fetches latest rates, generates `site/index.html` |
-| `boc_monitor.py` | CLI for fetching/updating rate CSVs |
-| `historical_rates.py` | `HistoricalRateFetcher` — pulls data from BoC Valet API |
-| `rate_plotter.py` | `RatePlotter` — Plotly-based interactive chart builder |
-| `config.py` | Paths, series codes, and constants |
-
-### Build the site locally
-
-```bash
-python build_site.py
-# opens site/index.html in a browser to preview
-```
-
-### Fetch/update rate data manually
+| `rates.py` | Every rate series: its sources, CSV path and label, plus the refresh logic. The only place a source is defined. |
+| `build_site.py` | Refreshes all series, then generates `site/` |
+| `send_rate_emails.py` | Detects policy rate changes and sends subscriber emails |
+| `boc_monitor.py` | BoC Monitor CLI (AI analysis, Canadian rate refresh and plots) |
+| `rate_plotter.py` | Plotly chart builder used by `boc_monitor.py plot` |
+| `config.py` | BoC Monitor settings |
 
 ```bash
-# Full historical fetch (100 years)
-python boc_monitor.py update-rates --full
-
-# Incremental update (since last fetch)
-python boc_monitor.py update-rates
+python rates.py                       # refresh every series into data/
+python build_site.py                  # refresh, then build site/
+python build_site.py --no-refresh     # build from the CSVs on disk
+python -m pytest -q tests             # offline tests
 ```
 
 ## Data Sources
 
-| Rate | BoC Series | Description |
-|---|---|---|
-| Policy Rate | `V122530` | Bank of Canada overnight rate target |
-| Prime Rate | `V80691311` | Commercial prime lending rate |
+| Series | File | Source | Frequency and timing |
+|---|---|---|---|
+| BoC policy rate (target for the overnight rate) | `data/ca_policy.csv` | [BoC Valet](https://www.bankofcanada.ca/valet/docs) `V39079` from 2009-04-21, [StatCan](https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1010013901) vector 39079 before that (same series, from 1992-12) | Business daily. A decision takes effect the day after the announcement, and Valet publishes day D on day D+1. |
+| Canadian prime rate | `data/ca_prime.csv` | BoC Valet `V80691311`, plus RBC's posted prime from RBC's public rates API | Official series is weekly (as at Wednesday). The RBC point carries its own effective date and updates the same day. It is best effort: if it fails, the run continues on the official series. |
+| Fed funds effective rate | `data/us_policy.csv` | [FRED](https://fred.stlouisfed.org/) `DFF` | Daily, published the next business day |
+| Fed target rate | `data/us_target.csv` | FRED `DFEDTAR` to 2008-12-15, then `DFEDTARU` (upper bound) | Daily, updated on the day of the FOMC decision |
+| US bank prime rate | `data/us_prime.csv` | FRED `DPRIME` | Daily, published within a day or two |
 
-Data is fetched fresh from the [BoC Valet API](https://www.bankofcanada.ca/valet/docs) at build time and is not committed to the repository.
+How a refresh works: each run downloads every series in full and merges it into the CSV on disk. Fresh values replace stored values on the same date, and stored dates missing from the download are kept. A failed or truncated download therefore can never move a series backwards. If a required source fails, the stored CSV is kept and the run prints a warning annotation. Rates outside the range from $-1\%$ to $30\%$ abort the refresh.
+
+Before October 2026 the Canadian "policy rate" came from `V122530`, which is the monthly Bank Rate. That is $0.25$ points above the policy rate and lags it by up to a month. It is no longer used.
 
 ## Automated Deployment
 
-`.github/workflows/deploy.yml` runs on:
+`.github/workflows/deploy.yml` runs hourly, on every push to `master`, and on manual trigger. Each run:
 
-- Every push to `master`
-- Daily at 14:00 UTC
-- Manual trigger (`workflow_dispatch`)
+1. runs the tests,
+2. refreshes all series and builds `site/`,
+3. sends rate-change emails,
+4. commits everything under `data/` (CSVs, email state, lag cache) in one commit,
+5. deploys to GitHub Pages.
 
-The workflow installs dependencies, runs `build_site.py` to generate `site/index.html`, then deploys to GitHub Pages using `actions/deploy-pages`.
+New observations arrive most days, so the data commits also keep the scheduled workflow from being disabled for inactivity.
+
+## Rate-Change Emails
+
+The trigger is the policy rate for Canada (`ca/policy`) and the target rate for the US (`us/target`). `data/rate_changes.json` stores the last four changes per region. A run sends an email when the newest change in the trigger CSV differs from the stored one.
+
+No address ever receives more than one email per UTC day, across both lists and confirmation emails. The subscribe worker enforces this for every send (see [`subscribe-proxy/README.md`](subscribe-proxy/README.md)). Each run checks both regions first and sends everything in one call. When both rates changed, people on both lists get one combined email. A rate email that would be someone's second of the day (for example, the second change was detected in a later run) is held back and sent the next day, so nobody misses a change.
+
+After switching a data source, run `python send_rate_emails.py --reseed` so the corrected history is stored without being mistaken for a new change. `--draft ca` writes a preview of the current email.
 
 ## Email Subscribers
 

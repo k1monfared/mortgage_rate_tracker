@@ -19,19 +19,23 @@ pipeline doesn't consume any of your Resend plan's audience/segment slots.
   /us/ subscribe form ──┘              ├─ KV: pending tokens, blocks, rate-limits
                                        ├─ D1 subscribe_logs: audit every event
                                        ├─ D1 subscribers:    confirmed list
-                                       ├─ D1 sends:          per-day dedup ledger
+                                       ├─ D1 sends:          one email per address per day, any list
                                        └─ Resend: confirmation email
 
-  GH Actions (daily)
+  GH Actions (hourly)
     ├─ build_site.py → refreshed CSVs
     └─ send_rate_emails.py
-         ├─ diffs latest prime rate against data/rate_changes.json
-         └─ on change: POST /broadcast (bearer-authed) → worker
-                                        ├─ per-recipient INSERT OR IGNORE sends
+         ├─ POST /flush → worker sends emails held back on earlier days
+         ├─ diffs each region's policy rate against data/rate_changes.json
+         └─ on change(s): one POST /broadcast (bearer-authed) → worker
+                                        ├─ one message per subscriber: ca, us,
+                                        │  or combined ca+us
+                                        ├─ claims today's slot in sends, or
+                                        │  holds the email in deferred
                                         ├─ Resend /emails/batch (chunks of 100)
                                         │  with per-recipient unsub URL in
                                         │  List-Unsubscribe + List-Unsubscribe-Post
-                                        └─ returns {sent, skipped_dedup, failed}
+                                        └─ returns {sent, deferred, failed}
 ```
 
 ## One-time setup
@@ -88,47 +92,37 @@ Resend directly now. You can delete them.
 
 ## How it runs
 
-1. The daily workflow calls `python build_site.py` (refreshes CSVs), then
+1. The hourly workflow calls `python build_site.py` (refreshes CSVs), then
    `python send_rate_emails.py`.
-2. The sender compares the newest row of each prime-rate CSV against
-   `data/rate_changes.json`. If no new change, it exits; rate_changes.json
-   is unchanged.
-3. On a new change, the sender composes the email and POSTs to the worker's
-   `/broadcast` endpoint with `Authorization: Bearer $BROADCAST_AUTH_KEY`.
-4. The worker loads the subscriber list for that region from D1. For each
-   subscriber, it runs `INSERT OR IGNORE INTO sends (email, list, date_sent)`
-   with today's UTC date. The insert either creates a new row (→ recipient
-   is added to the send batch) or is blocked by the `UNIQUE(email, list,
-   date_sent)` constraint (→ recipient already got an email for this region
-   today, skipped).
-5. The accepted recipients are sent via `POST /emails/batch` in chunks of
+2. The sender first calls the worker's `/flush`, which sends emails held
+   back by the daily limit on an earlier day.
+3. The sender compares the newest change in each region's trigger CSV
+   (BoC policy rate, Fed target rate) against `data/rate_changes.json`.
+4. If any region changed, it POSTs one `/broadcast` with a message per
+   changed region and, when both changed, a combined `ca+us` message.
+5. For each subscriber on a changed list, the worker picks the one message
+   that matches the changed lists they are on and claims today's row in
+   `sends`. If the address already got an email today, the message goes to
+   `deferred` for a later `/flush` instead. Nobody gets two emails in a day
+   and nobody misses a change.
+6. Claimed recipients are sent via `POST /emails/batch` in chunks of
    100, each envelope carrying:
    - A per-recipient `{{UNSUB_URL}}` substituted into the HTML and text body
+     (one token per list it covers, so a combined email's link leaves both)
    - `List-Unsubscribe` and `List-Unsubscribe-Post: List-Unsubscribe=One-Click`
      headers so Gmail/Outlook show their native "Unsubscribe" button
-6. The worker returns `{sent, skipped_dedup, failed}`. The sender logs those
-   counts (never individual addresses — GH Actions never sees who's on the
+7. The worker returns `{sent, deferred, failed}`. The sender logs those
+   counts (never individual addresses, so GH Actions never sees who's on the
    list).
-7. `data/rate_changes.json` is updated with the new change at the top of the
-   history (trimmed to three entries) and committed with `[skip ci]`.
+8. `data/rate_changes.json` is updated with the new change at the top of the
+   history (four entries) and committed with `[skip ci]`.
 
 ## Email format
 
-**Subject**: `Rate update: CA mortgage prime rate is now 4.45%`
-
-**Body (text)**:
-
-```
-The Canadian Commercial Prime Rate changed to 4.45% on 2025-11-05.
-Previously it was 4.70%, effective 2025-09-24 (42 days).
-Before that, 4.95% on 2025-03-19.
-
-View the full chart: https://k1monfared.github.io/mortgage_rate_tracker/ca/
-Unsubscribe: <per-recipient worker URL>
-Support: https://k1monfared.github.io/sponsor.html
-```
-
-The HTML version is the same text in a tidy envelope.
+Preview the current email for a region with
+`python send_rate_emails.py --draft ca`. A combined email has the same
+sections for each region under "Canada" and "United States" headings, one
+footer, and a subject joining both subjects with "and".
 
 ## Privacy — who can see the subscriber list
 
@@ -136,7 +130,7 @@ The HTML version is the same text in a tidy envelope.
 |-------------------------|-------------------------------------------------------------------------------------------|
 | **You (Cloudflare)**    | Full list via `wrangler d1 execute mortgage-subscribe-audit --command "SELECT …"`.        |
 | **Worker runtime**      | Reads addresses from D1 at send time, passes them to Resend. Never logs them to stdout.    |
-| **GitHub Actions**      | Never sees addresses. Only the aggregate counts `{sent, skipped_dedup, failed}`.           |
+| **GitHub Actions**      | Never sees addresses. Only the aggregate counts `{sent, deferred, failed}`.                |
 | **Resend**              | Sees each recipient's email once per delivery (unavoidable with any email provider).       |
 | **Anyone else**         | Zero access. There is no `/list`, `/subscribers`, or `/export` endpoint on the worker.     |
 
@@ -148,8 +142,9 @@ with no body content. A `curl` of any non-existing path returns 404.
 Resend's free-plan transactional: 3,000 emails/month, 100/day. CA and US
 prime rates change roughly 8 times a year each. For a subscriber list of N
 people, monthly outbound is `N × changes-that-month`, which stays well
-under the free-plan limits for any reasonable N. The per-day dedup
-guarantees no one gets spammed even if the workflow retries several times
+under the free-plan limits for any reasonable N. The daily send ledger
+guarantees no address gets more than one email per UTC day, across both
+lists and confirmation emails, even if the workflow retries several times
 in the same day.
 
 ## Local dry-runs

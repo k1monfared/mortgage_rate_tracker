@@ -4,12 +4,11 @@ Build script for GitHub Pages site.
 Builds per-region pages for Canada (BoC) and the United States (FRED), plus a
 small landing page at site/index.html. Data strategy:
 
-  - CA: data/boc_policy_rate.csv, data/commercial_prime_rate.csv (BoC Valet API)
-  - US: data/us_fed_funds_rate.csv, data/us_prime_rate.csv (FRED fredgraph CSV)
+  - Every series is defined in rates.py (sources, CSV path, label). Each build
+    refreshes all of them with rates.refresh_all() before rendering.
   - Each region has its own events file: data/events.json, data/us_events.json.
 
-On each build, only new records since the last stored date are fetched
-(incremental update). Output:
+Output:
 
   - site/index.html                  — landing page
   - site/ca/index.html               — Canadian tracker
@@ -25,8 +24,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fred_rates import FREDRateFetcher
-from historical_rates import HistoricalRateFetcher
+import rates
 
 # URL of the deployed Cloudflare Worker that accepts subscribe form POSTs.
 # Update this after `wrangler deploy` if the workers.dev subdomain differs.
@@ -271,7 +269,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="footer">
-    Data source: <a href="__SOURCE_URL__" target="_blank" rel="external noopener">__SOURCE_NAME__</a>
+    Data: __SOURCES_HTML__
     &mdash; Built __BUILD_TIME__
     &mdash; <a href="https://github.com/k1monfared/mortgage_rate_tracker" target="_blank" rel="external noopener">GitHub</a>
     &mdash; <a href="https://k1monfared.github.io/sponsor.html" rel="external noopener">Sponsor</a>
@@ -599,7 +597,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
         return {
           name: def.label,
           type: 'line', step: 'end',
-          // Initial data is the raw series. updateDots() runs on init and on
+          // Initial data is the raw series. applyCurrentWindow() runs on init and on
           // every zoom change, and rewrites this array with synthetic edge
           // points at the window boundaries (see buildWindowedSeriesData).
           data: rates[def.key].map(function(d) { return [d.date, d.rate]; }),
@@ -668,21 +666,28 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     //     step line to the right edge at the most recent in-window value.
     // Synthetic edge points carry `symbol: 'none'` so the dots-on toggle
     // never marks them as observations.
+    // All points are kept (they define the x-axis extent for zooming out),
+    // and the synthetic edges are spliced in at their x position so the
+    // array stays sorted.
     function buildWindowedSeriesData(raw, xMinMs, xMaxMs) {
       if (!raw || raw.length === 0) return [];
-      var data = raw.map(function(d) { return [d.date, d.rate]; });
-      var prevPoint = null, hasNext = false, lastRateInWindow = null;
+      var before = [], inside = [], after = [];
+      var prevPoint = null, lastRateInWindow = null;
       for (var i = 0; i < raw.length; i++) {
         var ts = new Date(raw[i].date).getTime();
+        var pt = [raw[i].date, raw[i].rate];
         if (ts < xMinMs) {
+          before.push(pt);
           prevPoint = raw[i];
         } else if (ts > xMaxMs) {
-          hasNext = true;
-          break;
+          after.push(pt);
         } else {
+          inside.push(pt);
           lastRateInWindow = raw[i].rate;
         }
       }
+      var hasNext = after.length > 0;
+      var data = inside;
       // Use the window's numeric timestamps directly for the synthetic edges,
       // NOT a truncated "YYYY-MM-DD" string. Truncation pushes the point back
       // to UTC midnight, which can land a few hours before xMinMs and get
@@ -697,7 +702,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
           data.push({ value: [xMaxMs, r], symbol: 'none' });
         }
       }
-      return data;
+      return before.concat(data, after);
     }
     function applyWindowedSeries(xMinMs, xMaxMs) {
       chart.setOption({
@@ -706,26 +711,25 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
         }),
       });
     }
-    function updateDots() {
+    // Read the window from the chart itself: ECharts snaps the requested
+    // start, and an edge point placed before the snapped start is filtered.
+    function applyCurrentWindow() {
       var opt = chart.getOption();
       var dz  = opt.dataZoom && opt.dataZoom[0];
-      if (!dz) return;
+      if (!dz) return null;
       var start = toMs(dz.startValue, 0);
       var end   = toMs(dz.endValue,   Date.now());
       applyWindowedSeries(start, end);
       applyDotsForRange(end - start);
-      saveState({ zoomStartMs: start, zoomEndMs: end });
+      return { zoomStartMs: start, zoomEndMs: end };
     }
-    chart.on('datazoom', updateDots);
+    chart.on('datazoom', function() {
+      var w = applyCurrentWindow();
+      if (w) saveState(w);
+    });
 
-    // Initial render doesn't emit a datazoom event, so evaluate the default
-    // window (defaultStart → today) directly to set edges and dot visibility.
-    (function initWindow() {
-      var startMs = toMs(defaultStart, 0);
-      var endMs   = Date.now();
-      applyWindowedSeries(startMs, endMs);
-      applyDotsForRange(endMs - startMs);
-    })();
+    // Initial render doesn't emit a datazoom event.
+    applyCurrentWindow();
 
     // Restore saved per-region state, if any.
     var saved = loadState();
@@ -908,20 +912,20 @@ LANDING_TEMPLATE = r"""<!DOCTYPE html>
 
   <div class="cards">
     <a class="card" href="ca/">
-      <div class="region">🇨🇦 Canada</div>
+      <div class="region">Canada</div>
       <div class="headline">Bank of Canada</div>
       <div class="rate-row">
         <span class="name">BoC Policy Rate</span>
         <span><span class="val" id="ca-policy">–</span><span class="date" id="ca-policy-date"></span></span>
       </div>
       <div class="rate-row">
-        <span class="name">Commercial Prime</span>
+        <span class="name">Prime Rate</span>
         <span><span class="val" id="ca-prime">–</span><span class="date" id="ca-prime-date"></span></span>
       </div>
       <div class="cta">View chart →</div>
     </a>
     <a class="card" href="us/">
-      <div class="region">🇺🇸 United States</div>
+      <div class="region">United States</div>
       <div class="headline">Federal Reserve</div>
       <div class="rate-row">
         <span class="name">Fed Funds</span>
@@ -1055,6 +1059,16 @@ STATIC_PAGES = {
             "any email to this address. Sorry for the hassle.</p>"
         ),
     },
+    "daily-limit": {
+        "title":   "Try again tomorrow",
+        "heading": "Try again tomorrow",
+        "body": (
+            "<p class='lede'>This address has already received an email from "
+            "us today, so we didn't send a confirmation email.</p>"
+            "<p>To keep inboxes quiet, no address gets more than one email a "
+            "day. Please submit the form again tomorrow (UTC).</p>"
+        ),
+    },
     "unsubscribed": {
         "title":   "Unsubscribed",
         "heading": "You're unsubscribed",
@@ -1080,29 +1094,27 @@ def render_static(page_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Region configuration
+# Region configuration. The series themselves (sources, CSVs, labels) live in
+# rates.py; this only adds what the page needs to render them.
 # ---------------------------------------------------------------------------
 REGIONS = [
     {
         "slug": "ca",
         "title": "Canadian Interest Rate Tracker",
-        "fetcher": HistoricalRateFetcher(),
-        "labels": {"policy": "BoC Policy Rate",
-                   "prime":  "Commercial Prime Rate"},
-        "source_name": "Bank of Canada Valet API",
-        "source_url":  "https://www.bankofcanada.ca/valet/docs",
+        "sources": [
+            ("Bank of Canada Valet API", "https://www.bankofcanada.ca/valet/docs"),
+            ("Statistics Canada", "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1010013901"),
+            ("RBC posted prime", "https://www.rbcroyalbank.com/rates/prime.html"),
+        ],
         "events_file": Path("data/events.json"),
         "meetings_file": None,
     },
     {
         "slug": "us",
         "title": "US Interest Rate Tracker",
-        "fetcher": FREDRateFetcher(),
-        "labels": {"policy": "Fed Funds Rate",
-                   "target": "Fed Target (Upper)",
-                   "prime":  "US Bank Prime Rate"},
-        "source_name": "Federal Reserve Economic Data (FRED)",
-        "source_url":  "https://fred.stlouisfed.org/",
+        "sources": [
+            ("Federal Reserve Economic Data (FRED)", "https://fred.stlouisfed.org/"),
+        ],
         "events_file": Path("data/us_events.json"),
         "meetings_file": Path("data/us_fomc_meetings.json"),
     },
@@ -1111,55 +1123,37 @@ REGIONS = [
 
 def _load_meeting_dates(meetings_file):
     """Return a set of YYYY-MM-DD strings from a meetings JSON file, or None
-    if the file is missing / unreadable."""
-    if meetings_file is None or not meetings_file.exists():
+    if no file is configured."""
+    if meetings_file is None:
         return None
-    try:
-        with open(meetings_file) as f:
-            return set(json.load(f).get("dates", []))
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"  Warning: could not read {meetings_file}: {e}")
-        return None
+    with open(meetings_file) as f:
+        return set(json.load(f)["dates"])
 
 
 def _compress_series(df, meeting_dates=None, min_delta=0.0):
     """Keep only rows that carry information for the step chart:
 
     - the first row (establishes the starting value),
-    - the last row (extends the line to 'today'),
+    - the last row (extends the line to the newest observation),
     - every rate transition where |rate - prev_kept| > min_delta,
     - every row whose date is in `meeting_dates` (shows a dot on days the
       central bank met, even when the rate didn't change).
 
     `min_delta` lets series like the Fed Funds effective rate (which wiggles
-    daily by a basis point or two) drop noise-level changes while still
-    capturing every announcement-day dot.
+    daily by a basis point or two) drop noise-level changes.
     """
-    if df is None or df.empty:
-        return df
     rows = df.reset_index(drop=True)
     keep = [False] * len(rows)
-    keep[0] = True
-    keep[-1] = True
+    keep[0] = keep[-1] = True
     prev_kept = float(rows.iloc[0]["rate"])
     for i in range(1, len(rows) - 1):
         rate = float(rows.iloc[i]["rate"])
-        date_str = rows.iloc[i]["date"].strftime("%Y-%m-%d")
         is_transition = abs(rate - prev_kept) > min_delta
-        is_meeting = meeting_dates is not None and date_str in meeting_dates
+        is_meeting = meeting_dates is not None and rows.iloc[i]["date"].strftime("%Y-%m-%d") in meeting_dates
         if is_transition or is_meeting:
             keep[i] = True
             prev_kept = rate
     return rows[keep].reset_index(drop=True)
-
-
-# Per-series compression tuning. Fed Funds effective rate has daily float
-# noise (~1bp); the others are piecewise-constant by construction.
-_SERIES_MIN_DELTA = {
-    "policy": 0.01,
-    "target": 0.0,
-    "prime":  0.0,
-}
 
 
 def _series_to_json(df):
@@ -1170,85 +1164,42 @@ def _series_to_json(df):
 
 
 def write_rates_json(cfg, out_path, build_time):
-    """Serialize a region's rates + metadata to JSON.
+    """Serialize a region's series + metadata to JSON.
 
-    Always writes `policy` and `prime` arrays. If the region's fetcher also
-    exposes a `target` series (currently US only, FOMC target upper bound),
-    that array is written too along with `target_current` meta fields.
-
-    Daily series are compressed to transitions + central-bank-meeting days
-    (when a meetings file is configured for the region), so the step chart
-    renders with dots on rate-change days AND on announcement days where the
-    rate was held, without 10k+ daily points weighing down the payload.
+    Writes one array per series in rates.region_series (policy, prime, and
+    target for the US), each compressed to transitions plus central-bank
+    meeting days, and `<key>_current` / `<key>_current_date` meta fields.
     """
-    fetcher  = cfg["fetcher"]
-    policy_df = fetcher.load_rate_data("policy")
-    prime_df  = fetcher.load_rate_data("prime")
-    if policy_df is None or prime_df is None or policy_df.empty or prime_df.empty:
-        raise RuntimeError(f"Missing data for region {cfg['slug']}")
-
-    latest_policy = policy_df.iloc[-1]
-    latest_prime  = prime_df.iloc[-1]
-
-    # Only compress regions with daily data (flagged by having a meetings_file).
-    # Monthly/weekly series (e.g. Canada) pass through as-is so the chart keeps
-    # a dot on every reported data point.
-    if cfg.get("meetings_file"):
-        meeting_dates = _load_meeting_dates(cfg["meetings_file"])
-        policy_compressed = _compress_series(policy_df, meeting_dates,
-                                             _SERIES_MIN_DELTA["policy"])
-        prime_compressed  = _compress_series(prime_df,  meeting_dates,
-                                             _SERIES_MIN_DELTA["prime"])
-    else:
-        meeting_dates = None
-        policy_compressed = policy_df
-        prime_compressed  = prime_df
-
-    payload = {
-        "policy": _series_to_json(policy_compressed),
-        "prime":  _series_to_json(prime_compressed),
-        "meta": {
-            "policy_current":      float(latest_policy["rate"]),
-            "policy_current_date": latest_policy["date"].strftime("%Y-%m-%d"),
-            "prime_current":       float(latest_prime["rate"]),
-            "prime_current_date":  latest_prime["date"].strftime("%Y-%m-%d"),
-            "built": build_time,
-            "labels": cfg["labels"],
-        },
-    }
-
-    has_target = "target" in getattr(fetcher, "SERIES", {})
-    if has_target:
-        target_df = fetcher.load_rate_data("target")
-        if target_df is not None and not target_df.empty:
-            if cfg.get("meetings_file"):
-                target_compressed = _compress_series(target_df, meeting_dates,
-                                                     _SERIES_MIN_DELTA["target"])
-            else:
-                target_compressed = target_df
-            payload["target"] = _series_to_json(target_compressed)
-            latest_target = target_df.iloc[-1]
-            payload["meta"]["target_current"]      = float(latest_target["rate"])
-            payload["meta"]["target_current_date"] = latest_target["date"].strftime("%Y-%m-%d")
+    meeting_dates = _load_meeting_dates(cfg["meetings_file"])
+    payload = {"meta": {"built": build_time, "labels": {}}}
+    for series in rates.region_series(cfg["slug"]):
+        df = rates.load(series)
+        payload[series.key] = _series_to_json(_compress_series(df, meeting_dates, series.min_delta))
+        latest = df.iloc[-1]
+        payload["meta"][f"{series.key}_current"] = float(latest["rate"])
+        payload["meta"][f"{series.key}_current_date"] = latest["date"].strftime("%Y-%m-%d")
+        payload["meta"]["labels"][series.key] = series.label
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(payload, f, separators=(",", ":"))
-    counts = f"{len(payload['policy'])} policy, {len(payload['prime'])} prime"
-    if "target" in payload:
-        counts += f", {len(payload['target'])} target"
+    counts = ", ".join(f"{len(payload[k])} {k}" for k in payload["meta"]["labels"])
     print(f"Wrote {out_path} ({counts} records)")
 
 
 def render_region(cfg, build_time):
     slug = cfg["slug"]
+    labels = {s.key: s.label for s in rates.region_series(slug)}
+    sources_html = ", ".join(
+        f'<a href="{url}" target="_blank" rel="external noopener">{name}</a>'
+        for name, url in cfg["sources"]
+    )
     substitutions = {
         "__TITLE__":          cfg["title"],
-        "__LABEL_POLICY__":   cfg["labels"]["policy"],
-        "__LABEL_PRIME__":    cfg["labels"]["prime"],
-        "__LABEL_TARGET__":   cfg["labels"].get("target", ""),
-        "__SOURCE_NAME__":    cfg["source_name"],
-        "__SOURCE_URL__":     cfg["source_url"],
+        "__LABEL_POLICY__":   labels["policy"],
+        "__LABEL_PRIME__":    labels["prime"],
+        "__LABEL_TARGET__":   labels.get("target", ""),
+        "__SOURCES_HTML__":   sources_html,
         "__SLUG__":           slug,
         "__CA_ACTIVE__":      "active" if slug == "ca" else "",
         "__US_ACTIVE__":      "active" if slug == "us" else "",
@@ -1267,7 +1218,10 @@ def render_landing(build_time):
     return LANDING_TEMPLATE.replace("__BUILD_TIME__", build_time)
 
 
-def build_site():
+def build_site(refresh=True):
+    if refresh:
+        rates.refresh_all()
+
     site_dir = Path("site")
     site_dir.mkdir(exist_ok=True)
     build_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -1275,29 +1229,13 @@ def build_site():
     for cfg in REGIONS:
         slug = cfg["slug"]
         print(f"\n{'=' * 70}\nBuilding region: {slug}\n{'=' * 70}")
-        fetcher = cfg["fetcher"]
-        for series_key in getattr(fetcher, "SERIES", {}).keys() or ("policy", "prime"):
-            fetcher.update_incremental(series_key)
-
-        out_dir = site_dir / slug
-        out_dir.mkdir(parents=True, exist_ok=True)
-        data_out = out_dir / "data"
-        data_out.mkdir(exist_ok=True)
+        data_out = site_dir / slug / "data"
+        data_out.mkdir(parents=True, exist_ok=True)
 
         write_rates_json(cfg, data_out / "rates.json", build_time)
-
-        events_src = cfg["events_file"]
-        if events_src.exists():
-            shutil.copy(events_src, data_out / "events.json")
-            print(f"Copied {events_src} → {data_out / 'events.json'}")
-        else:
-            print(f"WARNING: {events_src} not found — writing empty events file")
-            with open(data_out / "events.json", "w") as f:
-                json.dump({"regions": []}, f)
-
-        html = render_region(cfg, build_time)
-        (out_dir / "index.html").write_text(html, encoding="utf-8")
-        print(f"Built {out_dir / 'index.html'}")
+        shutil.copy(cfg["events_file"], data_out / "events.json")
+        (site_dir / slug / "index.html").write_text(render_region(cfg, build_time), encoding="utf-8")
+        print(f"Built {site_dir / slug / 'index.html'}")
 
     (site_dir / "index.html").write_text(render_landing(build_time), encoding="utf-8")
     print(f"Built landing page: {site_dir / 'index.html'}")
@@ -1310,4 +1248,8 @@ def build_site():
 
 
 if __name__ == "__main__":
-    build_site()
+    import argparse
+    parser = argparse.ArgumentParser(description="Refresh rate data and build the static site.")
+    parser.add_argument("--no-refresh", action="store_true",
+                        help="Build from the CSVs on disk without downloading.")
+    build_site(refresh=not parser.parse_args().no_refresh)

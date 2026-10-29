@@ -1,5 +1,7 @@
 # Bank of Canada Monitor - Implementation Summary
 
+> **Superseded (2026-10-29).** Historical record of the original build. The rate data layer described here (`historical_rates.py`, series `V122530`, `metadata.json`, `update-rates --full`) was replaced by `rates.py`. `V122530` is the monthly Bank Rate, not the policy rate. See the README for current sources.
+
 ## ✅ What Was Implemented
 
 All requested features have been successfully implemented:

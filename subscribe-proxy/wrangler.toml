@@ -16,6 +16,7 @@ CONFIRMATION_SENT_URL = "https://k1monfared.github.io/mortgage_rate_tracker/conf
 BLOCKED_URL           = "https://k1monfared.github.io/mortgage_rate_tracker/blocked/"
 UNSUBSCRIBED_URL      = "https://k1monfared.github.io/mortgage_rate_tracker/unsubscribed/"
 ERROR_URL             = "https://k1monfared.github.io/mortgage_rate_tracker/?err=1"
+DAILY_LIMIT_URL       = "https://k1monfared.github.io/mortgage_rate_tracker/daily-limit/"
 
 SUCCESS_URL_CA = "https://k1monfared.github.io/mortgage_rate_tracker/subscribed/?list=ca"
 SUCCESS_URL_US = "https://k1monfared.github.io/mortgage_rate_tracker/subscribed/?list=us"

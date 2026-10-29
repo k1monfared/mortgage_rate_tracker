@@ -1,5 +1,7 @@
 # Bank of Canada Monitor Enhancement Plan
 
+> **Superseded (2026-10-29).** Historical planning notes. The rate data layer described here (`historical_rates.py`, series `V122530`, `metadata.json`) was replaced by `rates.py`. `V122530` is the monthly Bank Rate, not the policy rate. See the README for current sources.
+
 ## Overview
 Enhance the BoC Monitor with historical rate tracking, interactive plotting, intelligent document chunking, and bug fixes.
 

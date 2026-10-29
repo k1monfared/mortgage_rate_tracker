@@ -708,10 +708,7 @@ Examples:
   # Run policy analysis (default)
   python boc_monitor.py analyze
 
-  # Initialize historical data (100 years)
-  python boc_monitor.py update-rates --full
-
-  # Update incremental data
+  # Refresh the Canadian rate CSVs (see rates.py)
   python boc_monitor.py update-rates
 
   # Generate plots
@@ -727,9 +724,7 @@ Examples:
     analyze_parser = subparsers.add_parser('analyze', help='Run policy analysis')
 
     # Update rates command
-    update_parser = subparsers.add_parser('update-rates', help='Update historical rate data')
-    update_parser.add_argument('--full', action='store_true',
-                              help='Full historical fetch (100 years)')
+    subparsers.add_parser('update-rates', help='Refresh the Canadian rate CSVs')
 
     # Plot command
     plot_parser = subparsers.add_parser('plot', help='Generate rate plots')
@@ -766,65 +761,29 @@ Examples:
             traceback.print_exc()
 
     elif args.command == 'update-rates':
-        from historical_rates import HistoricalRateFetcher
+        import rates
 
-        fetcher = HistoricalRateFetcher()
-
-        if args.full:
-            print("Fetching 100 years of historical data...")
-            fetcher.initialize_historical_data()
-        else:
-            print("Updating incremental data...")
-            fetcher.update_incremental('policy')
-            fetcher.update_incremental('prime')
-
+        for series in rates.region_series('ca'):
+            rates.refresh(series)
         print("\n✅ Rate data updated successfully!")
 
-        # Show metadata
-        metadata = fetcher.get_metadata()
-        if metadata:
-            print("\nMetadata:")
-            print("-" * 70)
-            for key, value in metadata.items():
-                print(f"  {key}: {value}")
-
     elif args.command == 'plot':
-        from historical_rates import HistoricalRateFetcher
+        import rates
         from rate_plotter import RatePlotter
 
-        fetcher = HistoricalRateFetcher()
         plotter = RatePlotter()
+        policy, prime = rates.get('ca', 'policy'), rates.get('ca', 'prime')
 
         if args.type == 'policy':
-            data = fetcher.load_rate_data('policy')
-            if data is not None:
-                fig = plotter.plot_single_rate(data, 'BoC Policy Rate',
-                                              'Bank of Canada Policy Rate History')
-                plotter.save_plot(fig, args.output)
-                print(f"\n✅ Plot saved to output/{args.output}")
-            else:
-                print("❌ No policy rate data found. Run 'python boc_monitor.py update-rates --full' first.")
-
+            fig = plotter.plot_single_rate(rates.load(policy), policy.label,
+                                           'Bank of Canada Policy Rate History')
         elif args.type == 'prime':
-            data = fetcher.load_rate_data('prime')
-            if data is not None:
-                fig = plotter.plot_single_rate(data, 'Commercial Prime Rate',
-                                              'Commercial Prime Rate History')
-                plotter.save_plot(fig, args.output)
-                print(f"\n✅ Plot saved to output/{args.output}")
-            else:
-                print("❌ No prime rate data found. Run 'python boc_monitor.py update-rates --full' first.")
-
+            fig = plotter.plot_single_rate(rates.load(prime), prime.label,
+                                           'Canadian Prime Rate History')
         else:  # both
-            policy_data = fetcher.load_rate_data('policy')
-            prime_data = fetcher.load_rate_data('prime')
-
-            if policy_data is not None and prime_data is not None:
-                fig = plotter.plot_dual_rates(policy_data, prime_data)
-                plotter.save_plot(fig, args.output)
-                print(f"\n✅ Plot saved to output/{args.output}")
-            else:
-                print("❌ Missing rate data. Run 'python boc_monitor.py update-rates --full' first.")
+            fig = plotter.plot_dual_rates(rates.load(policy), rates.load(prime))
+        plotter.save_plot(fig, args.output)
+        print(f"\n✅ Plot saved to output/{args.output}")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
+# BoC Monitor extras (boc_monitor.py, rate_plotter.py). The site and email
+# pipeline only need requirements.txt.
+-r requirements.txt
 anthropic>=0.18.0
-requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
-pandas>=2.0.0
 plotly>=6.5.0
