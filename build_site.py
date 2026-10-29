@@ -420,9 +420,24 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     return result;
   }
 
+  // The series only store change dates, so ECharts' tooltip would jump
+  // between them. Instead the tooltip reads the time under the mouse
+  // (hoverMs, tracked in init) rounded down to the UTC day, so every
+  // calendar day gets its own reading.
+  var DAY_MS = 24 * 3600 * 1000;
+  var hoverMs = null;
+  function hoveredDay(ts) {
+    return Math.floor(ts / DAY_MS) * DAY_MS;
+  }
+
+  function axisPointerLabel(p) {
+    if (p.axisDimension === 'x') return new Date(hoveredDay(p.value)).toISOString().slice(0, 10);
+    return Number(p.value).toFixed(2) + '%';
+  }
+
   function tooltipFormatter(params) {
     if (!params || !params.length) return '';
-    var ts   = params[0].axisValue;
+    var ts   = hoveredDay(hoverMs != null ? hoverMs : params[0].axisValue);
     var date = new Date(ts).toISOString().slice(0, 10);
     var items = SERIES_DEFS.map(function(def) {
       return { label: def.label, color: def.color, rate: findStepRate(rates[def.key], ts) };
@@ -542,7 +557,10 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
         backgroundColor: pal.tooltip,
         borderColor: pal.border,
         textStyle: { color: pal.text },
-        axisPointer: { type: 'cross', crossStyle: { color: pal.muted } },
+        axisPointer: {
+          type: 'cross', snap: false, crossStyle: { color: pal.muted },
+          label: { formatter: axisPointerLabel },
+        },
         formatter: tooltipFormatter,
       },
       legend: {
@@ -558,6 +576,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
         axisTick:  { lineStyle: { color: pal.axis } },
         axisLabel: { fontSize: 13, color: pal.text },
         splitLine: { show: false },
+        axisPointer: { snap: false },
       },
       yAxis: {
         type: 'value',
@@ -609,6 +628,17 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
         };
       }),
     });
+
+    // Track the time under the mouse for the per-day tooltip. When the day
+    // changes, re-show the tooltip at the mouse so it refreshes even if the
+    // nearest data point (all ECharts itself tracks) did not change.
+    chart.getZr().on('mousemove', function(e) {
+      var x = chart.convertFromPixel({ xAxisIndex: 0 }, e.offsetX);
+      var changed = hoverMs == null || hoveredDay(x) !== hoveredDay(hoverMs);
+      hoverMs = x;
+      if (changed) chart.dispatchAction({ type: 'showTip', x: e.offsetX, y: e.offsetY });
+    });
+    chart.getZr().on('globalout', function() { hoverMs = null; });
 
     // Events toggle — markArea lives on the first series only (one band per
     // region); the other series always get the empty markArea placeholder.
