@@ -89,8 +89,6 @@ def test_feed_failure_keeps_stored_announcements(data, monkeypatch):
 def test_pending_change_emails_once_and_links_the_announcement(data, monkeypatch):
     series, policy = data
     rates.refresh_announcements(policy)
-    monkeypatch.setattr(emails, "refresh_lag_for_region", lambda slug: None)
-    monkeypatch.setattr(emails, "cached_lag_days", lambda slug: None)
 
     state = {"ca": {"series": emails.REGIONS["ca"]["label"],
                     "changes": [{"date": "2025-10-30", "value": 2.25}]}}

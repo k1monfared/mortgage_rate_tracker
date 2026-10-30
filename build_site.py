@@ -459,12 +459,33 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
   // calendar day gets its own reading.
   var DAY_MS = 24 * 3600 * 1000;
   var hoverMs = null;
+  // Newest observation day. Nothing after it is read, and a pointer within
+  // EDGE_SNAP_PX of it snaps to it (see pointerMs), since zoomed out a single
+  // day is a fraction of a pixel and the newest one sits at the plot edge.
+  var lastDayMs = null;
+  var EDGE_SNAP_PX = 14;
   function hoveredDay(ts) {
-    return Math.floor(ts / DAY_MS) * DAY_MS;
+    var day = Math.floor(ts / DAY_MS) * DAY_MS;
+    return lastDayMs != null ? Math.min(day, lastDayMs) : day;
+  }
+
+  // Keep the tooltip inside the chart, on the side of the pointer with more
+  // room. On narrow screens it sits at the top of the plot so a finger never
+  // covers it.
+  function tooltipPosition(point, params, dom, rect, size) {
+    var vw = size.viewSize[0], cw = size.contentSize[0], ch = size.contentSize[1];
+    var gap = 16;
+    var x = point[0] > vw / 2 ? point[0] - gap - cw : point[0] + gap;
+    x = Math.max(4, Math.min(x, vw - cw - 4));
+    var y = vw < 640 ? 44 : point[1] - ch / 2;
+    y = Math.max(4, Math.min(y, size.viewSize[1] - ch - 4));
+    return [x, y];
   }
 
   function axisPointerLabel(p) {
-    if (p.axisDimension === 'x') return new Date(hoveredDay(p.value)).toISOString().slice(0, 10);
+    if (p.axisDimension === 'x') {
+      return new Date(hoveredDay(hoverMs != null ? hoverMs : p.value)).toISOString().slice(0, 10);
+    }
     return Number(p.value).toFixed(2) + '%';
   }
 
@@ -570,6 +591,10 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
 
     var pal = chartPalette();
     SERIES_DEFS = buildSeriesDefs(pal);
+    lastDayMs = Math.max.apply(null, SERIES_DEFS.map(function(def) {
+      var s = rates[def.key];
+      return new Date(s[s.length - 1].date).getTime();
+    }));
 
     // Default x-axis window: past 18 months
     var defaultStart = (function() {
@@ -615,7 +640,13 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       textStyle: { color: pal.text },
       tooltip: {
         trigger: 'axis',
-        enterable: true,
+        // Only a pinned tooltip takes the mouse (to click its link). An
+        // unpinned one would swallow the chart's mousemoves when the
+        // pointer slides onto it.
+        enterable: false,
+        confine: true,
+        position: tooltipPosition,
+        extraCssText: 'max-width: 90vw; white-space: normal;',
         backgroundColor: pal.tooltip,
         borderColor: pal.border,
         textStyle: { color: pal.text },
@@ -694,12 +725,24 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     // Track the time under the mouse for the per-day tooltip. When the day
     // changes, re-show the tooltip at the mouse so it refreshes even if the
     // nearest data point (all ECharts itself tracks) did not change.
+    function pointerMs(offsetX) {
+      var lastPx = chart.convertToPixel({ xAxisIndex: 0 }, lastDayMs);
+      if (offsetX >= lastPx - EDGE_SNAP_PX) return lastDayMs;
+      return chart.convertFromPixel({ xAxisIndex: 0 }, offsetX);
+    }
+    // ECharts only shows an axis tooltip inside the plot, so a pointer in
+    // the margin right of it is moved onto the plot's last pixel.
+    function tipX(offsetX) {
+      var rect = chart.getModel().getComponent('grid').coordinateSystem.getRect();
+      return Math.min(offsetX, rect.x + rect.width - 1);
+    }
     chart.getZr().on('mousemove', function(e) {
       if (tooltipPinned) return;
-      var x = chart.convertFromPixel({ xAxisIndex: 0 }, e.offsetX);
-      var changed = hoverMs == null || hoveredDay(x) !== hoveredDay(hoverMs);
+      var x = pointerMs(e.offsetX);
+      var changed = hoverMs == null || hoveredDay(x) !== hoveredDay(hoverMs)
+        || tipX(e.offsetX) !== e.offsetX;
       hoverMs = x;
-      if (changed) chart.dispatchAction({ type: 'showTip', x: e.offsetX, y: e.offsetY });
+      if (changed) chart.dispatchAction({ type: 'showTip', x: tipX(e.offsetX), y: e.offsetY });
     });
     chart.getZr().on('globalout', function() { if (!tooltipPinned) hoverMs = null; });
 
@@ -707,14 +750,18 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     // values or clicking an announcement link. The next click unpins.
     function setTooltipPinned(pinned, e) {
       tooltipPinned = pinned;
-      chart.setOption({ tooltip: { triggerOn: pinned ? 'none' : 'mousemove|click' } });
-      chart.dispatchAction({ type: 'showTip', x: e.offsetX, y: e.offsetY });
+      chart.setOption({ tooltip: { triggerOn: pinned ? 'none' : 'mousemove|click', enterable: pinned } });
+      chart.dispatchAction({ type: 'showTip', x: tipX(e.offsetX), y: e.offsetY });
     }
     chart.getZr().on('click', function(e) {
-      // Ignore clicks on the legend and the zoom slider.
-      if (!chart.containPixel({ gridIndex: 0 }, [e.offsetX, e.offsetY])) return;
-      var x = chart.convertFromPixel({ xAxisIndex: 0 }, e.offsetX);
-      hoverMs = x;
+      // A click on the pinned tooltip's link opens it and keeps the pin.
+      var target = e.event && e.event.target;
+      if (target && target.closest && target.closest('a')) return;
+      // Ignore clicks on the legend and the zoom slider, but accept the
+      // margin right of the plot (edge snapping).
+      var rect = chart.getModel().getComponent('grid').coordinateSystem.getRect();
+      if (e.offsetY < rect.y || e.offsetY > rect.y + rect.height || e.offsetX < rect.x) return;
+      hoverMs = pointerMs(e.offsetX);
       setTooltipPinned(!tooltipPinned, e);
     });
 

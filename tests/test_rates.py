@@ -114,13 +114,6 @@ def test_trigger_detects_only_new_changes(tmp_path):
     assert emails.merge_new_change(merged, latest) == (merged, False)
 
 
-def test_prime_lag_counts_same_day_moves(tmp_path):
-    policy, prime = tmp_path / "p.csv", tmp_path / "q.csv"
-    policy.write_text("date,rate\n2026-01-01,2.0\n2026-03-01,2.25\n")
-    prime.write_text("date,rate\n2026-01-01,4.2\n2026-03-01,4.45\n")
-    assert emails.compute_prime_lag_days(policy, prime)["median_days"] == 0
-
-
 def test_committed_email_state_matches_trigger_csvs():
     state = json.loads(emails.STATE_PATH.read_text())
     for slug, cfg in emails.REGIONS.items():

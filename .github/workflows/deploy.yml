@@ -36,7 +36,7 @@ jobs:
           BROADCAST_AUTH_KEY: ${{ secrets.BROADCAST_AUTH_KEY }}
           SENDER_BASE_URL: https://k1monfared.github.io/mortgage_rate_tracker
         run: python send_rate_emails.py
-      # Commit every data file together (rate CSVs, email state, lag cache) so
+      # Commit every data file together (rate CSVs, announcements, email state) so
       # the next run starts from exactly what this run saw. New observations
       # land most days, which also keeps the scheduled workflow from being
       # disabled for inactivity.

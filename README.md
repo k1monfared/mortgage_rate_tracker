@@ -68,7 +68,7 @@ Before October 2026 the Canadian "policy rate" came from `V122530`, which is the
 1. runs the tests,
 2. refreshes all series and builds `site/`,
 3. sends rate-change emails,
-4. commits everything under `data/` (CSVs, email state, lag cache) in one commit,
+4. commits everything under `data/` (CSVs, announcements, email state) in one commit,
 5. deploys to GitHub Pages.
 
 New observations arrive most days, so the data commits also keep the scheduled workflow from being disabled for inactivity.
@@ -76,6 +76,16 @@ New observations arrive most days, so the data commits also keep the scheduled w
 ## Rate-Change Emails
 
 The trigger is the policy rate for Canada (`ca/policy`) and the target rate for the US (`us/target`). `data/rate_changes.json` stores the last four changes per region. A run sends an email when the newest change in the trigger CSV differs from the stored one.
+
+The email also says what the prime rate did, using only the prime data available when it is sent (`prime_status` in `send_rate_emails.py`):
+
+| Prime data | Sentence |
+|---|---|
+| none | omitted |
+| ends before the change date | the latest known prime and its date, and that the banks' prime for this change is not published yet |
+| changes on the change date | old and new prime, "on the same day" |
+| first changes after the change date | old and new prime and the date it moved |
+| reaches past the change date, no change | prime is unchanged, as of the newest observation |
 
 No address ever receives more than one email per UTC day, across both lists and confirmation emails. The subscribe worker enforces this for every send (see [`subscribe-proxy/README.md`](subscribe-proxy/README.md)). Each run checks both regions first and sends everything in one call. When both rates changed, people on both lists get one combined email. A rate email that would be someone's second of the day (for example, the second change was detected in a later run) is held back and sent the next day, so nobody misses a change.
 

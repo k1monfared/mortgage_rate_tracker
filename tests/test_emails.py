@@ -32,7 +32,6 @@ def test_pipeline_sends_both_changes_in_one_call(monkeypatch):
     calls = []
     monkeypatch.setattr(emails, "send_via_proxy", lambda m, *a: calls.append(sorted(m)) or True)
     monkeypatch.setattr(emails, "flush_deferred", lambda *a: True)
-    monkeypatch.setattr(emails, "refresh_lag_for_region", lambda slug: None)
     # Stored history one change behind the data for both regions.
     state = {slug: {"series": cfg["label"], "changes": history(slug)[1:]}
              for slug, cfg in emails.REGIONS.items()}
@@ -44,7 +43,6 @@ def test_pipeline_sends_both_changes_in_one_call(monkeypatch):
 def test_failed_broadcast_is_retried_next_run(monkeypatch):
     monkeypatch.setattr(emails, "send_via_proxy", lambda *a: False)
     monkeypatch.setattr(emails, "flush_deferred", lambda *a: True)
-    monkeypatch.setattr(emails, "refresh_lag_for_region", lambda slug: None)
     behind = {slug: {"series": cfg["label"], "changes": history(slug)[1:]}
               for slug, cfg in emails.REGIONS.items()}
     state = emails.run_pipeline(dict(behind), "https://proxy", "key", BASE, dry_run=False)

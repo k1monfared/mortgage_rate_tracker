@@ -13,7 +13,8 @@ publishes the same date and rate later, nothing new is detected and no second
 email is sent.
 
 The mortgage prime rate for each region is shown inside the email as context
-(same-date value + a typical-lag note), but is NOT what triggers a send.
+(what prime did around the change, see prime_status), but is NOT what
+triggers a send.
 
 All regions are checked first, then every new change goes out in a single
 POST to the subscribe proxy's /broadcast endpoint. The payload carries one
@@ -63,7 +64,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics
 import sys
 from html import escape as html_escape
 from pathlib import Path
@@ -76,9 +76,7 @@ import rates
 
 DATA_DIR = rates.DATA_DIR
 STATE_PATH = DATA_DIR / "rate_changes.json"
-LAG_CACHE_PATH = DATA_DIR / "prime_lag.json"
 HISTORY_LENGTH = 4
-LAG_WINDOW_YEARS = 2
 DEFAULT_BASE_URL = "https://k1monfared.github.io/mortgage_rate_tracker"
 
 # Per-region config. Keep slug in sync with build_site.REGIONS and with the
@@ -191,108 +189,39 @@ def prime_on_date(prime_csv: Path, date_str: str) -> Optional[float]:
     return float(sub.iloc[-1]["rate"])
 
 
-def current_prime(prime_csv: Path) -> Tuple[Optional[float], Optional[str]]:
+def prime_status(prime_csv: Path, change_date: str) -> Optional[str]:
+    """One sentence on what the prime rate did around a policy change on
+    `change_date`, based only on the prime data available now:
+
+    1. No prime data at all: None (the email omits the sentence).
+    2. The prime data does not reach `change_date` yet: the latest known
+       prime, and that the banks' response is not published yet.
+    3. Prime changed on `change_date`: old and new prime, same day.
+    4. Prime first changed after `change_date`: old and new prime and the date.
+    5. Prime has not changed since `change_date` and the data reaches past
+       it: prime is unchanged, as of the newest prime observation.
+    """
     df = _load_rate_csv(prime_csv)
     if df.empty:
-        return None, None
-    row = df.iloc[-1]
-    return float(row["rate"]), row["date"].strftime("%Y-%m-%d")
-
-
-def _rate_transitions(df: pd.DataFrame) -> List[pd.Timestamp]:
-    out, prev = [], None
-    for _, row in df.iterrows():
-        r = float(row["rate"])
-        if prev is None or r != prev:
-            out.append(row["date"])
-        prev = r
-    return out
-
-
-def compute_prime_lag_days(policy_csv: Path, prime_csv: Path,
-                           years: int = LAG_WINDOW_YEARS,
-                           max_gap: int = 90) -> Optional[Dict]:
-    """Compute the median days from policy→next-prime change over the last
-    `years` years. Expensive (scans two CSVs), so we only call this when a
-    new change is detected — the result lives in the lag cache.
-
-    Returns a dict {median_days, samples, window_start} or None if no samples.
-    """
-    policy_df = _load_rate_csv(policy_csv)
-    prime_df  = _load_rate_csv(prime_csv)
-    if policy_df.empty or prime_df.empty:
         return None
-
-    latest = max(policy_df["date"].max(), prime_df["date"].max())
-    window_start = latest - pd.DateOffset(years=years)
-
-    policy_dates = [d for d in _rate_transitions(policy_df) if d >= window_start]
-    prime_dates  = _rate_transitions(prime_df)
-
-    lags: List[int] = []
-    for pd_ in policy_dates:
-        # Prime usually moves the same day the policy change takes effect, so
-        # a same-date prime transition counts (lag 0).
-        next_prime = [d for d in prime_dates if d >= pd_]
-        if not next_prime:
-            continue
-        lag = (next_prime[0] - pd_).days
-        if lag <= max_gap:
-            lags.append(lag)
-    if not lags:
-        return None
-    return {
-        "median_days":  int(round(statistics.median(lags))),
-        "samples":      len(lags),
-        "window_start": window_start.strftime("%Y-%m-%d"),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Lag cache — recomputed only when a new change is detected, then reused on
-# subsequent runs. Keeps the per-run work minimal.
-# ---------------------------------------------------------------------------
-def load_lag_cache() -> Dict:
-    if not LAG_CACHE_PATH.exists():
-        return {}
-    try:
-        with open(LAG_CACHE_PATH) as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Could not parse {LAG_CACHE_PATH}: {e} — treating as empty.", file=sys.stderr)
-        return {}
-
-
-def save_lag_cache(cache: Dict) -> None:
-    LAG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(LAG_CACHE_PATH, "w") as f:
-        json.dump(cache, f, indent=2, sort_keys=True)
-        f.write("\n")
-    print(f"Wrote {LAG_CACHE_PATH}")
-
-
-def refresh_lag_for_region(slug: str) -> Optional[int]:
-    """Recompute the lag for `slug` over the last LAG_WINDOW_YEARS years and
-    persist it. Returns the new median, or the currently-cached value if the
-    recompute produced nothing usable.
-    """
-    cfg = REGIONS[slug]
-    result = compute_prime_lag_days(Path(cfg["trigger_csv"]), Path(cfg["prime_csv"]))
-    cache = load_lag_cache()
-    if result is not None:
-        cache[slug] = {
-            **result,
-            "refreshed_at": pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-        save_lag_cache(cache)
-        print(f"[{slug}] Refreshed prime-lag cache: median {result['median_days']} days "
-              f"({result['samples']} samples since {result['window_start']}).")
-        return result["median_days"]
-    return cache.get(slug, {}).get("median_days")
-
-
-def cached_lag_days(slug: str) -> Optional[int]:
-    return load_lag_cache().get(slug, {}).get("median_days")
+    day = pd.to_datetime(change_date)
+    latest = df.iloc[-1]
+    latest_txt = f"**{latest['rate']:.2f}%** as of {latest['date']:%Y-%m-%d}"
+    if latest["date"] < day:
+        return (f"The prime rate was {latest_txt}. The banks' prime rate for "
+                f"this change has not been published yet.")
+    before = df[df["date"] < day]
+    if before.empty:
+        return f"The prime rate is {latest_txt}."
+    prev = float(before.iloc[-1]["rate"])
+    moves = df[(df["date"] >= day) & (df["rate"] != prev)]
+    if moves.empty:
+        return f"The prime rate is unchanged at {latest_txt}."
+    move = moves.iloc[0]
+    when = ("on the same day" if move["date"] == day
+            else f"on {move['date']:%Y-%m-%d}")
+    return (f"The prime rate {direction_word(float(move['rate']), prev)} from "
+            f"{prev:.2f}% to **{move['rate']:.2f}%** {when}.")
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +274,6 @@ def _fmt_signed_pct(x: Optional[float]) -> str:
     return f"{sign}{abs(x):.2f}%"
 
 
-def _lag_note(lag_days: Optional[int]) -> str:
-    if lag_days is None:
-        return ""
-    if lag_days == 0:
-        return " Prime rate typically changes the same day."
-    return f" Prime rate typically follows within about {lag_days} days."
-
-
 def _fmt_days(d: Optional[int]) -> str:
     return "—" if d is None else str(d)
 
@@ -381,13 +302,6 @@ def _region_body(region_slug: str, history: List[Dict], base_url: str) -> Dict[s
         direction = "changed to"
         delta_str = None
 
-    # Prime rate as of the change date, falling back to the most recent prime
-    # observation if there is nothing on or before the change date.
-    prime_at_change = prime_on_date(prime_csv, newest["date"])
-    prime_lede = prime_at_change if prime_at_change is not None else current_prime(prime_csv)[0]
-    # Read from the cached lag (refreshed whenever a change is detected).
-    lag_note = _lag_note(cached_lag_days(region_slug))
-
     rows = _enriched_history(history, region_slug, prime_csv)
     subject = f"{cfg['subject_prefix']} {direction} to {rate_pct}"
 
@@ -396,8 +310,9 @@ def _region_body(region_slug: str, history: List[Dict], base_url: str) -> Dict[s
                 f"on {newest['date']} by {delta_str}.")
     else:
         lede = f"The **{cfg['label']}** is now **{rate_pct}** as of {newest['date']}."
-    prime_line = (f"The **{cfg['prime_label']}** is **{prime_lede:.2f}%**.{lag_note}"
-                  if prime_lede is not None else None)
+    prime_line = prime_status(prime_csv, newest["date"])
+    if prime_line:
+        prime_line = prime_line.replace("The prime rate", f"The {cfg['prime_label']}", 1)
     # The central bank's own announcement of this change, when there is one.
     ann = rates.announcement_for(trigger_series(region_slug), newest["date"])
     ann_intro = f"Announced by the {cfg['central_bank']} on {ann['announced']}: " if ann else ""
@@ -630,9 +545,6 @@ def detect_region(slug: str, state: Dict) -> Tuple[Dict, bool]:
         return region_block, False
 
     print(f"[{slug}] New change detected: {merged[0]['date']} -> {merged[0]['value']}%")
-    # The prime-lag sample set has grown. Refresh the cached 2-year median
-    # before composing so the email reflects current data.
-    refresh_lag_for_region(slug)
     return region_block, True
 
 
@@ -704,17 +616,9 @@ def main(argv: Optional[List[str]] = None) -> int:
              "stays in place).",
     )
     parser.add_argument(
-        "--refresh-lag", metavar="REGION", nargs="?", const="all",
-        help="Recompute the cached prime-lag (last 2 years) for REGION (or "
-             "'all'). Normally only needed for first-run seeding; the change-"
-             "detection pipeline refreshes this automatically when a change "
-             "lands.",
-    )
-    parser.add_argument(
         "--reseed", metavar="REGION", nargs="?", const="all",
         help="Rewrite the stored change history for REGION (or 'all') from "
-             "its trigger CSV without sending anything, and refresh its "
-             "prime-lag cache. Use after changing a data source so the "
+             "its trigger CSV without sending anything. Use after changing a data source so the "
              "corrected history is not mistaken for a new change.",
     )
     args = parser.parse_args(argv)
@@ -730,27 +634,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             changes = trigger_changes(slug)
             state[slug] = {"series": REGIONS[slug]["label"], "changes": changes}
             print(f"[{slug}] Reseeded: top {changes[0]['date']} {changes[0]['value']}%")
-            refresh_lag_for_region(slug)
         save_state(state)
-        return 0
-
-    if args.refresh_lag:
-        slugs = list(REGIONS) if args.refresh_lag == "all" else [args.refresh_lag.lower()]
-        for slug in slugs:
-            if slug not in REGIONS:
-                parser.error(f"Unknown region '{slug}'. Known: {', '.join(REGIONS)}.")
-            refresh_lag_for_region(slug)
         return 0
 
     if args.draft:
         slug = args.draft.lower()
         if slug not in REGIONS:
             parser.error(f"Unknown region '{slug}'. Known: {', '.join(REGIONS)}.")
-        if cached_lag_days(slug) is None:
-            # First-run seed so the draft has a lag note. Subsequent draft
-            # calls reuse the cache until a change triggers a refresh.
-            print(f"[{slug}] Lag cache empty — seeding from the last {LAG_WINDOW_YEARS} years.")
-            refresh_lag_for_region(slug)
         if args.out:
             out_path = Path(args.out)
         elif slug == "ca":
