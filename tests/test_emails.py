@@ -6,7 +6,7 @@ BASE = "https://example.com/tracker"
 
 
 def history(slug):
-    return emails.extract_recent_changes(emails.REGIONS[slug]["trigger_csv"])
+    return emails.trigger_changes(slug)
 
 
 def test_one_region_change_sends_only_its_message():

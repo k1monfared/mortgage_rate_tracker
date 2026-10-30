@@ -6,6 +6,12 @@ Change-detection strategy, per region (series and CSVs are defined in rates.py):
   ca -> ca/policy   (BoC target for the overnight rate, Valet V39079)
   us -> us/target   (FOMC target rate, upper bound since 2008, FRED DFEDTARU)
 
+For ca, a rate change the Bank of Canada has announced but Valet has not yet
+published counts as the newest change (rates.load_with_pending), so the email
+goes out on announcement day and links to the announcement. When Valet
+publishes the same date and rate later, nothing new is detected and no second
+email is sent.
+
 The mortgage prime rate for each region is shown inside the email as context
 (same-date value + a typical-lag note), but is NOT what triggers a send.
 
@@ -59,6 +65,7 @@ import json
 import os
 import statistics
 import sys
+from html import escape as html_escape
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -80,6 +87,7 @@ REGIONS: Dict[str, Dict[str, str]] = {
     "ca": {
         "label":            "Bank of Canada policy rate",
         "central_bank":     "Bank of Canada",
+        "trigger":          ("ca", "policy"),
         "trigger_csv":      str(rates.get("ca", "policy").csv),
         "prime_csv":        str(rates.get("ca", "prime").csv),
         "prime_label":      "Canadian mortgage prime rate",
@@ -90,6 +98,7 @@ REGIONS: Dict[str, Dict[str, str]] = {
     "us": {
         "label":            "Fed target rate (upper bound)",
         "central_bank":     "Federal Reserve",
+        "trigger":          ("us", "target"),
         "trigger_csv":      str(rates.get("us", "target").csv),
         "prime_csv":        str(rates.get("us", "prime").csv),
         "prime_label":      "US mortgage prime rate",
@@ -135,7 +144,20 @@ def _load_rate_csv(csv_path: Path) -> pd.DataFrame:
 
 def extract_recent_changes(csv_path: Path, limit: int = HISTORY_LENGTH) -> List[Dict]:
     """Return the last `limit` distinct-value transitions, newest first."""
-    df = _load_rate_csv(csv_path)
+    return _changes(_load_rate_csv(csv_path), limit)
+
+
+def trigger_changes(slug: str, limit: int = HISTORY_LENGTH) -> List[Dict]:
+    """The region's recent trigger changes, including a change the central
+    bank has announced but its data feed has not published yet."""
+    return _changes(rates.load_with_pending(trigger_series(slug)), limit)
+
+
+def trigger_series(slug: str) -> rates.Series:
+    return rates.get(*REGIONS[slug]["trigger"])
+
+
+def _changes(df: pd.DataFrame, limit: int) -> List[Dict]:
     changes: List[Dict] = []
     prev_rate: Optional[float] = None
     for _, row in df.iterrows():
@@ -280,8 +302,7 @@ def direction_word(new_val: float, prev_val: float) -> str:
     return "decreased" if new_val < prev_val else "increased"
 
 
-def _enriched_history(history: List[Dict], trigger_csv: Path,
-                      prime_csv: Path) -> List[Dict]:
+def _enriched_history(history: List[Dict], slug: str, prime_csv: Path) -> List[Dict]:
     """Annotate each history row with same-date prime, days-since-last, and
     signed policy delta vs the immediately-preceding change. For the oldest
     row, the prior change is pulled from the CSV so the delta is still
@@ -289,7 +310,7 @@ def _enriched_history(history: List[Dict], trigger_csv: Path,
     """
     # Pull enough extra entries from the CSV to cover one prior to the
     # oldest displayed row (if it's outside `history`).
-    extended = extract_recent_changes(trigger_csv, limit=HISTORY_LENGTH + 5)
+    extended = trigger_changes(slug, limit=HISTORY_LENGTH + 5)
     out: List[Dict] = []
     for i, h in enumerate(history):
         date = h["date"]
@@ -367,7 +388,7 @@ def _region_body(region_slug: str, history: List[Dict], base_url: str) -> Dict[s
     # Read from the cached lag (refreshed whenever a change is detected).
     lag_note = _lag_note(cached_lag_days(region_slug))
 
-    rows = _enriched_history(history, Path(cfg["trigger_csv"]), prime_csv)
+    rows = _enriched_history(history, region_slug, prime_csv)
     subject = f"{cfg['subject_prefix']} {direction} to {rate_pct}"
 
     if delta_str:
@@ -377,6 +398,9 @@ def _region_body(region_slug: str, history: List[Dict], base_url: str) -> Dict[s
         lede = f"The **{cfg['label']}** is now **{rate_pct}** as of {newest['date']}."
     prime_line = (f"The **{cfg['prime_label']}** is **{prime_lede:.2f}%**.{lag_note}"
                   if prime_lede is not None else None)
+    # The central bank's own announcement of this change, when there is one.
+    ann = rates.announcement_for(trigger_series(region_slug), newest["date"])
+    ann_intro = f"Announced by the {cfg['central_bank']} on {ann['announced']}: " if ann else ""
 
     def bold_html(s: str) -> str:
         parts = s.split("**")
@@ -384,6 +408,8 @@ def _region_body(region_slug: str, history: List[Dict], base_url: str) -> Dict[s
 
     # --- Markdown ----------------------------------------------------------
     md = [lede, ""]
+    if ann:
+        md += [f"{ann_intro}[{ann['title']}]({ann['url']})", ""]
     if prime_line:
         md += [prime_line, ""]
     md += [
@@ -411,6 +437,8 @@ def _region_body(region_slug: str, history: List[Dict], base_url: str) -> Dict[s
         )
     html = (
         f"<p>{bold_html(lede)}</p>\n"
+        + (f"<p>{html_escape(ann_intro)}<a href=\"{html_escape(ann['url'])}\" "
+           f"style=\"color:#0b5394;\">{html_escape(ann['title'])}</a></p>\n" if ann else "")
         + (f"<p>{bold_html(prime_line)}</p>\n" if prime_line else "")
         + "<p><strong>Recent history</strong></p>"
         "<table role=\"presentation\" cellpadding=\"6\" cellspacing=\"0\" "
@@ -429,6 +457,8 @@ def _region_body(region_slug: str, history: List[Dict], base_url: str) -> Dict[s
 
     # --- Plain text --------------------------------------------------------
     text = [lede.replace("**", "")]
+    if ann:
+        text.append(f"{ann_intro}{ann['title']}: {ann['url']}")
     if prime_line:
         text.append(prime_line.replace("**", ""))
     text += ["", "Recent history:", "  date        policy   prime   days  change"]
@@ -572,7 +602,7 @@ def detect_region(slug: str, state: Dict) -> Tuple[Dict, bool]:
         print(f"Missing trigger CSV for {slug}: {trigger_csv}. Skipping.")
         return state.get(slug, {}), False
 
-    latest = extract_recent_changes(trigger_csv)
+    latest = trigger_changes(slug)
     if not latest:
         print(f"No data in {trigger_csv} for {slug}.")
         return state.get(slug, {}), False
@@ -649,8 +679,7 @@ def write_draft(slug: str, base_url: str, out_path: Path) -> None:
     the send-state file is for dedup, not for content, and can lag or hold
     pre-refactor values.
     """
-    cfg = REGIONS[slug]
-    changes = extract_recent_changes(Path(cfg["trigger_csv"]))
+    changes = trigger_changes(slug)
     if not changes:
         raise RuntimeError(f"No history available for {slug}.")
 
@@ -698,7 +727,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         for slug in slugs:
             if slug not in REGIONS:
                 parser.error(f"Unknown region '{slug}'. Known: {', '.join(REGIONS)}.")
-            changes = extract_recent_changes(Path(REGIONS[slug]["trigger_csv"]))
+            changes = trigger_changes(slug)
             state[slug] = {"series": REGIONS[slug]["label"], "changes": changes}
             print(f"[{slug}] Reseeded: top {changes[0]['date']} {changes[0]['value']}%")
             refresh_lag_for_region(slug)

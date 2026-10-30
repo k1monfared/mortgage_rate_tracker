@@ -116,7 +116,6 @@ def test_committed_email_state_matches_trigger_csvs():
         assert state[slug]["series"] == cfg["label"]
         # Every stored change must exist in the data with the same value, so
         # a source switch can never leave history from a different series.
-        in_data = {c["date"]: c["value"] for c in
-                   emails.extract_recent_changes(cfg["trigger_csv"], limit=50)}
+        in_data = {c["date"]: c["value"] for c in emails.trigger_changes(slug, limit=50)}
         stored = {c["date"]: c["value"] for c in state[slug]["changes"]}
         assert stored and all(in_data.get(d) == v for d, v in stored.items()), slug

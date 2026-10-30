@@ -1,0 +1,45 @@
+{
+  "source": "https://www.bankofcanada.ca/content_type/press-releases/feed/",
+  "announcements": [
+    {
+      "announced": "2026-10-28",
+      "rate": 2.5,
+      "title": "Bank of Canada raises the policy rate by 25 basis points to 2½%",
+      "summary": "The Bank of Canada today increased its target for the overnight rate by 25 basis points to 2.5%, with the Bank Rate at 2.75% and the deposit rate at 2.45%.",
+      "url": "https://www.bankofcanada.ca/2026/10/fad-press-release-2026-10-28/",
+      "effective": "2026-10-29",
+      "previous": 2.25,
+      "status": "pending"
+    },
+    {
+      "announced": "2026-09-02",
+      "rate": 2.25,
+      "title": "Bank of Canada maintains the policy rate at 2¼%",
+      "summary": "The Bank of Canada today held its target for the overnight rate at 2.25%, with the Bank Rate at 2.5% and the deposit rate at 2.20%.",
+      "url": "https://www.bankofcanada.ca/2026/09/fad-press-release-2026-09-02/",
+      "effective": "2026-09-03",
+      "previous": 2.25,
+      "status": "held"
+    },
+    {
+      "announced": "2026-07-15",
+      "rate": 2.25,
+      "title": "Bank of Canada maintains the policy rate at 2¼%",
+      "summary": "The Bank of Canada today held its target for the overnight rate at 2.25%, with the Bank Rate at 2.5% and the deposit rate at 2.20%.",
+      "url": "https://www.bankofcanada.ca/2026/07/fad-press-release-2026-07-15/",
+      "effective": "2026-07-16",
+      "previous": 2.25,
+      "status": "held"
+    },
+    {
+      "announced": "2026-06-10",
+      "rate": 2.25,
+      "title": "Bank of Canada maintains the policy rate at 2¼%",
+      "summary": "The Bank of Canada today held its target for the overnight rate at 2.25%, with the Bank Rate at 2.5% and the deposit rate at 2.20%.",
+      "url": "https://www.bankofcanada.ca/2026/06/fad-press-release-2026-06-10/",
+      "effective": "2026-06-11",
+      "previous": 2.25,
+      "status": "held"
+    }
+  ]
+}

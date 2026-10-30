@@ -46,11 +46,18 @@ python -m pytest -q tests             # offline tests
 |---|---|---|---|
 | BoC policy rate (target for the overnight rate) | `data/ca_policy.csv` | [BoC Valet](https://www.bankofcanada.ca/valet/docs) `V39079` from 2009-04-21, [StatCan](https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1010013901) vector 39079 before that (same series, from 1992-12) | Business daily. A decision takes effect the day after the announcement, and Valet publishes day D on day D+1. |
 | Canadian prime rate | `data/ca_prime.csv` | BoC Valet `V80691311`, plus RBC's posted prime from RBC's public rates API | Official series is weekly (as at Wednesday). The RBC point carries its own effective date and updates the same day. It is best effort: if it fails, the run continues on the official series. |
+| BoC rate announcements | `data/ca_announcements.json` | [BoC press release RSS feed](https://www.bankofcanada.ca/content_type/press-releases/feed/) | Same morning as the decision. See below. |
 | Fed funds effective rate | `data/us_policy.csv` | [FRED](https://fred.stlouisfed.org/) `DFF` | Daily, published the next business day |
 | Fed target rate | `data/us_target.csv` | FRED `DFEDTAR` to 2008-12-15, then `DFEDTARU` (upper bound) | Daily, updated on the day of the FOMC decision |
 | US bank prime rate | `data/us_prime.csv` | FRED `DPRIME` | Daily, published within a day or two |
 
 How a refresh works: each run downloads every series in full and merges it into the CSV on disk. Fresh values replace stored values on the same date, and stored dates missing from the download are kept. A failed or truncated download therefore can never move a series backwards. If a required source fails, the stored CSV is kept and the run prints a warning annotation. Rates outside the range from $-1\%$ to $30\%$ abort the refresh.
+
+Announced changes: Valet publishes a new policy rate a day or more after the Bank announces it. Each run therefore also reads the Bank's press release feed. Every rate decision in it is stored in `data/ca_announcements.json` (title, summary, link, announcement date, new rate). The rate is read from the release title with a regular expression and must agree with the decimal rate in the summary. A title that cannot be read is skipped with a warning. The new rate takes effect on the next business day, and the announcement gets one of three statuses:
+
+- `pending`: Valet has no observation on or after the effective date yet. The announced rate is used as the newest point of the policy series everywhere: the chart (drawn in a different color, with "(announced)" and a link to the press release in the tooltip, which a click pins open so the link can be clicked), the stat box ("announced ..., effective ..."), and the email trigger. The email links to the announcement.
+- `confirmed`: Valet has published the effective date. Valet's value is used and the chart color goes back to normal. If Valet disagrees with the announced rate, a warning is printed and Valet wins. Since the email already went out for the same date and rate, nothing new is sent.
+- `held`: the decision left the rate unchanged.
 
 Before October 2026 the Canadian "policy rate" came from `V122530`, which is the monthly Bank Rate. That is $0.25$ points above the policy rate and lags it by up to a month. It is no longer used.
 

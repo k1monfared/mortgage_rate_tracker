@@ -20,6 +20,19 @@ Sources (all free, no API key):
              Updated on the day of the FOMC decision.
   us/prime   Bank prime loan rate, FRED DPRIME (daily).
 
+Announcements (ca/policy only): Valet publishes a new policy rate a day or
+more after the Bank announces it. The Bank's press release RSS feed carries
+the announcement the same morning, so every run reads it, parses the new rate
+from the release title (cross-checked against the summary) and stores each
+rate announcement in data/ca_announcements.json. The new rate takes effect on
+the next business day. Until Valet has an observation on or after that day
+the announcement is "pending": load_with_pending() adds it to the series as
+its newest point, so the chart, the stat boxes and the email trigger all use
+it. Once Valet covers the effective date the announcement becomes
+"confirmed" and Valet's own value is used. Announcements that leave the rate
+unchanged are stored as "held". A title that cannot be parsed is skipped with
+a warning, which leaves the pipeline exactly as it was without the feed.
+
 Refresh rule: every run downloads each series in full and merges it into the
 CSV on disk. Fresh observations override stored ones on the same date, and
 stored dates the fresh download lacks are kept. A source outage or a
@@ -34,7 +47,10 @@ CLI:
 
 from __future__ import annotations
 
+import json
+import re
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from functools import partial
 from io import StringIO
@@ -53,6 +69,7 @@ STATCAN_URL = "https://www150.statcan.gc.ca/t1/wds/rest/getDataFromVectorByRefer
 FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 RBC_RATES_URL = "https://apps.royalbank.com/uaw0/app-services/public-rates/api/publicrates"
 RBC_PRIME_ID = "0006470002"  # "Royal Bank Prime" in RBC's ratesIdMapping/pr.js
+BOC_PRESS_FEED_URL = "https://www.bankofcanada.ca/content_type/press-releases/feed/"
 
 # Anything outside this range is treated as a parsing or source error.
 RATE_MIN, RATE_MAX = -1.0, 30.0
@@ -266,7 +283,156 @@ def refresh(series: Series) -> pd.DataFrame:
 
 
 def refresh_all() -> Dict[Tuple[str, str], pd.DataFrame]:
-    return {k: refresh(s) for k, s in SERIES.items()}
+    result = {k: refresh(s) for k, s in SERIES.items()}
+    refresh_announcements(result[ANNOUNCED_SERIES])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Bank of Canada rate announcements (see the module docstring)
+# ---------------------------------------------------------------------------
+ANNOUNCED_SERIES = ("ca", "policy")
+FRACTIONS = {"¼": 0.25, "½": 0.5, "¾": 0.75}
+# "raises the policy rate by 25 basis points to 2½%", "maintains the policy
+# rate at 2¼%", "lowers policy rate to ¼ percent".
+TITLE_RATE_RE = re.compile(
+    r"policy (?:interest )?rate\b.*?\b(?:to|at)\s+(\d+(?:\.\d+)?)?\s*([¼½¾])?\s*(?:%|per\s?cent)",
+    re.IGNORECASE)
+# Titles of rate decisions, as opposed to other releases that mention the rate
+# ("publishes its 2027 schedule for policy interest rate announcements").
+DECISION_RE = re.compile(
+    r"\b(raises|increases|lowers|reduces|cuts|maintains|holds)\b.*\b(policy|overnight)",
+    re.IGNORECASE)
+# "... overnight rate by 25 basis points to 2.5%" in the summary.
+SUMMARY_RATE_RE = re.compile(
+    r"overnight rate\b.*?\b(?:to|at)\s+(\d+(?:\.\d+)?)\s*(?:%|per\s?cent)", re.IGNORECASE)
+
+
+def announcements_path() -> Path:
+    return DATA_DIR / "ca_announcements.json"
+
+
+def parse_announced_rate(title: str, summary: str = "") -> Optional[float]:
+    """The new policy rate in a rate announcement, or None if `title` is not
+    one or the rate cannot be read reliably."""
+    m = TITLE_RATE_RE.search(title)
+    if not m or not (m.group(1) or m.group(2)):
+        return None
+    rate = float(m.group(1) or 0) + FRACTIONS.get(m.group(2) or "", 0.0)
+    # Policy rates move in quarter points. Anything else is a parse error.
+    if round(rate * 100) % 25 != 0 or not RATE_MIN <= rate <= RATE_MAX:
+        return None
+    s = SUMMARY_RATE_RE.search(summary or "")
+    if s and float(s.group(1)) != rate:
+        return None
+    return rate
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def fetch_boc_announcements() -> List[Dict]:
+    """Rate announcements in the Bank's press release feed, newest first."""
+    root = ET.fromstring(_get(BOC_PRESS_FEED_URL).content)
+    out = []
+    for item in (e for e in root.iter() if _local(e.tag) == "item"):
+        fields = {}
+        for child in item:
+            fields.setdefault(_local(child.tag), (child.text or "").strip())
+        title = fields.get("title", "")
+        if not DECISION_RE.search(title):
+            continue
+        rate = parse_announced_rate(title, fields.get("description", ""))
+        if rate is None:
+            _warn(f"could not read a rate from BoC announcement {title!r}. Skipped.")
+            continue
+        out.append({
+            "announced": fields.get("date", "")[:10],
+            "rate":      rate,
+            "title":     title,
+            "summary":   fields.get("description", ""),
+            "url":       fields.get("link") or item.get(
+                "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about", ""),
+        })
+    return out
+
+
+def _rate_on(df: pd.DataFrame, date: pd.Timestamp) -> Optional[float]:
+    sub = df[df["date"] <= date]
+    return None if sub.empty else float(sub.iloc[-1]["rate"])
+
+
+def load_announcements() -> List[Dict]:
+    path = announcements_path()
+    if not path.exists():
+        return []
+    return json.loads(path.read_text())["announcements"]
+
+
+def classify(item: Dict, policy: pd.DataFrame) -> Dict:
+    """Set the effective date and status of one announcement against Valet."""
+    announced = pd.Timestamp(item["announced"])
+    effective = announced + pd.offsets.BDay(1)
+    previous = _rate_on(policy, announced)
+    if previous == item["rate"]:
+        status = "held"
+    elif policy["date"].max() >= effective:
+        status = "confirmed"
+        published = _rate_on(policy, policy[policy["date"] >= effective]["date"].min())
+        if published != item["rate"]:
+            _warn(f"BoC announced {item['rate']}% effective {effective:%Y-%m-%d} but "
+                  f"Valet shows {published}%. Valet is used.")
+    else:
+        status = "pending"
+    return {**item, "effective": effective.strftime("%Y-%m-%d"),
+            "previous": previous, "status": status}
+
+
+def refresh_announcements(policy: pd.DataFrame) -> List[Dict]:
+    """Fetch the feed, merge it into the stored announcements (by URL) and
+    re-classify every one against the policy series. A feed failure keeps the
+    stored announcements."""
+    print("\n[ca/policy] Bank of Canada rate announcements")
+    stored = {a["url"]: a for a in load_announcements()}
+    try:
+        for a in fetch_boc_announcements():
+            stored[a["url"]] = {**stored.get(a["url"], {}), **a}
+    except Exception as e:
+        _warn(f"BoC press release feed failed: {e}. Keeping stored announcements.")
+    items = sorted((classify(a, policy) for a in stored.values()),
+                   key=lambda a: a["announced"], reverse=True)
+    path = announcements_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"source": BOC_PRESS_FEED_URL, "announcements": items},
+                               indent=2, ensure_ascii=False) + "\n")
+    for a in items[:3]:
+        print(f"  {a['announced']}: {a['rate']:.2f}% effective {a['effective']} ({a['status']})")
+    return items
+
+
+def pending(series: Series) -> Optional[Dict]:
+    """The announced but not yet published change for `series`, if any."""
+    if (series.region, series.key) != ANNOUNCED_SERIES:
+        return None
+    return next((a for a in load_announcements() if a["status"] == "pending"), None)
+
+
+def announcement_for(series: Series, date: str) -> Optional[Dict]:
+    """The announcement of the change that took effect on `date`, if any."""
+    if (series.region, series.key) != ANNOUNCED_SERIES:
+        return None
+    return next((a for a in load_announcements()
+                 if a["effective"] == date and a["status"] != "held"), None)
+
+
+def load_with_pending(series: Series) -> pd.DataFrame:
+    """load(series) plus a pending announced change as the newest point."""
+    df = load(series)
+    p = pending(series)
+    if p is None:
+        return df
+    return merge(df, _frame([(p["effective"], p["rate"])]))
 
 
 if __name__ == "__main__":

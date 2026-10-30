@@ -51,6 +51,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       --accent-policy: #58a6ff;
       --accent-target: #ffb86c;
       --accent-prime:  #d2a8ff;
+      --accent-pending: #3fb950;
       --chart-axis: #8b949e;
       --chart-grid: #30363d;
       --tooltip-bg: #16213e;
@@ -63,6 +64,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       --accent-policy: #2E86AB;
       --accent-target: #C25500;
       --accent-prime:  #A23B72;
+      --accent-pending: #1a7f37;
       --chart-axis: #6a737d;
       --chart-grid: #e1e4e8;
       --tooltip-bg: #ffffff;
@@ -312,7 +314,36 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       policy:   v('--accent-policy',  '#58a6ff'),
       target:   v('--accent-target',  '#ffb86c'),
       prime:    v('--accent-prime',   '#d2a8ff'),
+      pending:  v('--accent-pending', '#3fb950'),
     };
+  }
+
+  // A change the central bank has announced but its data feed has not
+  // published yet (rates.pending.<key>). It is already the newest point of
+  // its series. This overlay redraws just that step in the pending color, on
+  // top of the series and under the same legend name, so it reads as one line.
+  function pendingKeys() {
+    return SERIES_DEFS.map(function(d) { return d.key; })
+      .filter(function(k) { return rates.pending && rates.pending[k]; });
+  }
+
+  function pendingSeries(p) {
+    return pendingKeys().map(function(key) {
+      var a   = rates.pending[key];
+      var def = SERIES_DEFS.filter(function(d) { return d.key === key; })[0];
+      return {
+        name: def.label, type: 'line', z: 5, silent: true,
+        data: [{ value: [a.effective, a.previous], symbol: 'none' }, [a.effective, a.rate]],
+        lineStyle: { color: p.pending, width: 3 },
+        itemStyle: { color: p.pending },
+        symbol: 'circle', symbolSize: 7,
+      };
+    });
+  }
+
+  function pendingOn(key, ts) {
+    var a = rates.pending && rates.pending[key];
+    return !!a && ts >= new Date(a.effective).getTime();
   }
 
   function buildSeriesDefs(pal) {
@@ -362,7 +393,9 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
           itemStyle: { color: def.color },
           markPoint: { label: { color: def.color, backgroundColor: p.bg, borderColor: p.border } },
         };
-      }),
+      }).concat(pendingKeys().map(function() {
+        return { lineStyle: { color: p.pending }, itemStyle: { color: p.pending } };
+      })),
     };
   }
 
@@ -439,8 +472,12 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     if (!params || !params.length) return '';
     var ts   = hoveredDay(hoverMs != null ? hoverMs : params[0].axisValue);
     var date = new Date(ts).toISOString().slice(0, 10);
+    var pal = chartPalette();
     var items = SERIES_DEFS.map(function(def) {
-      return { label: def.label, color: def.color, rate: findStepRate(rates[def.key], ts) };
+      var announced = pendingOn(def.key, ts);
+      return { label: def.label + (announced ? ' (announced)' : ''),
+               color: announced ? pal.pending : def.color,
+               rate: findStepRate(rates[def.key], ts) };
     }).filter(function(it) { return it.rate !== null; });
     // Sort by rate descending so the tooltip lists series top-to-bottom in
     // the same vertical order the lines stack on the chart at this x.
@@ -450,8 +487,29 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       html += '<span style="color:' + it.color + '">&#9679;</span> ' + it.label
            + ': <strong>' + it.rate.toFixed(2) + '%</strong><br>';
     });
+    // Link each announced change to the central bank's release. The tooltip
+    // follows the mouse, so a click pins it (see init) to make it reachable.
+    var links = SERIES_DEFS.filter(function(def) { return pendingOn(def.key, ts); });
+    links.forEach(function(def) {
+      var a = rates.pending[def.key];
+      html += '<a href="' + escapeHtml(a.url) + '" target="_blank" rel="external noopener" '
+           + 'style="color:' + pal.link + '">' + escapeHtml(a.title) + '</a><br>';
+    });
+    if (links.length) {
+      html += '<span style="font-size:11px;color:' + pal.muted + '">'
+           + (tooltipPinned ? 'Click the chart to close' : 'Click to keep this open') + '</span>';
+    }
     return html;
   }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function(c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  // True while a click has pinned a tooltip that contains an announcement link.
+  var tooltipPinned = false;
 
   // ── Chart update helpers ───────────────────────────────────────────────
   function updateStatBoxes() {
@@ -460,6 +518,12 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     document.getElementById('policyDate').textContent = 'as of ' + meta.policy_current_date;
     document.getElementById('primeRate').textContent  = meta.prime_current.toFixed(2) + '%';
     document.getElementById('primeDate').textContent  = 'as of ' + meta.prime_current_date;
+    ['policy', 'prime'].forEach(function(key) {
+      var a = rates.pending && rates.pending[key];
+      if (!a) return;
+      document.getElementById(key + 'Date').textContent =
+        'announced ' + a.announced + ', effective ' + a.effective;
+    });
   }
 
   function updateChartSeries() {
@@ -554,6 +618,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
       textStyle: { color: pal.text },
       tooltip: {
         trigger: 'axis',
+        enterable: true,
         backgroundColor: pal.tooltip,
         borderColor: pal.border,
         textStyle: { color: pal.text },
@@ -626,19 +691,38 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
           markPoint: makeMarkPoint(def.color),
           markArea: emptyMarkArea,
         };
-      }),
+      }).concat(pendingSeries(pal)),
     });
 
     // Track the time under the mouse for the per-day tooltip. When the day
     // changes, re-show the tooltip at the mouse so it refreshes even if the
     // nearest data point (all ECharts itself tracks) did not change.
     chart.getZr().on('mousemove', function(e) {
+      if (tooltipPinned) return;
       var x = chart.convertFromPixel({ xAxisIndex: 0 }, e.offsetX);
       var changed = hoverMs == null || hoveredDay(x) !== hoveredDay(hoverMs);
       hoverMs = x;
       if (changed) chart.dispatchAction({ type: 'showTip', x: e.offsetX, y: e.offsetY });
     });
-    chart.getZr().on('globalout', function() { hoverMs = null; });
+    chart.getZr().on('globalout', function() { if (!tooltipPinned) hoverMs = null; });
+
+    // Clicking a day with an announced change pins its tooltip so the
+    // announcement link can be clicked. The next click on the chart unpins.
+    function setTooltipPinned(pinned, e) {
+      tooltipPinned = pinned;
+      chart.setOption({ tooltip: { triggerOn: pinned ? 'none' : 'mousemove|click' } });
+      chart.dispatchAction({ type: 'showTip', x: e.offsetX, y: e.offsetY });
+    }
+    chart.getZr().on('click', function(e) {
+      var x = chart.convertFromPixel({ xAxisIndex: 0 }, e.offsetX);
+      hoverMs = x;
+      if (tooltipPinned) {
+        setTooltipPinned(false, e);
+        return;
+      }
+      var hasLink = SERIES_DEFS.some(function(def) { return pendingOn(def.key, hoveredDay(x)); });
+      if (hasLink) setTooltipPinned(true, e);
+    });
 
     // Events toggle — markArea lives on the first series only (one band per
     // region); the other series always get the empty markArea placeholder.
@@ -1199,11 +1283,17 @@ def write_rates_json(cfg, out_path, build_time):
     Writes one array per series in rates.region_series (policy, prime, and
     target for the US), each compressed to transitions plus central-bank
     meeting days, and `<key>_current` / `<key>_current_date` meta fields.
+    A change announced but not yet published (rates.pending) is included in
+    its series and described under `pending.<key>` so the page can color it.
     """
     meeting_dates = _load_meeting_dates(cfg["meetings_file"])
-    payload = {"meta": {"built": build_time, "labels": {}}}
+    payload = {"meta": {"built": build_time, "labels": {}}, "pending": {}}
     for series in rates.region_series(cfg["slug"]):
-        df = rates.load(series)
+        df = rates.load_with_pending(series)
+        p = rates.pending(series)
+        if p:
+            payload["pending"][series.key] = {
+                k: p[k] for k in ("effective", "rate", "previous", "announced", "title", "url")}
         payload[series.key] = _series_to_json(_compress_series(df, meeting_dates, series.min_delta))
         latest = df.iloc[-1]
         payload["meta"][f"{series.key}_current"] = float(latest["rate"])
