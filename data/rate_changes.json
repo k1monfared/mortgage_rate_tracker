@@ -2,6 +2,10 @@
   "ca": {
     "changes": [
       {
+        "date": "2026-10-29",
+        "value": 2.5
+      },
+      {
         "date": "2025-10-30",
         "value": 2.25
       },
@@ -12,10 +16,6 @@
       {
         "date": "2025-03-13",
         "value": 2.75
-      },
-      {
-        "date": "2025-01-30",
-        "value": 3.0
       }
     ],
     "series": "Bank of Canada policy rate"
