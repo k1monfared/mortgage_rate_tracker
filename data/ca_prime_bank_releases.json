@@ -1,0 +1,11 @@
+{
+  "description": "Canadian prime rate changes with their exact effective dates, each taken from a bank's own press release. Overrides the weekly Valet series V80691311, which only shows a change on the first Wednesday after it.",
+  "changes": [
+    {"effective": "2024-10-24", "rate": 5.95, "bank": "TD", "url": "https://stories.td.com/ca/en/news/2024-10-23-td-canada-trust-announces-change-to-td-prime-rate"},
+    {"effective": "2024-12-12", "rate": 5.45, "bank": "TD", "url": "https://stories.td.com/ca/en/news/2024-12-11-td-canada-trust-announces-change-to-td-prime-rate"},
+    {"effective": "2025-01-30", "rate": 5.20, "bank": "TD", "url": "https://stories.td.com/ca/en/news/2025-01-29-td-canada-trust-announces-change-to-td-prime-rate"},
+    {"effective": "2025-03-13", "rate": 4.95, "bank": "TD", "url": "https://td.mediaroom.com/2025-03-12-TD-Canada-Trust-announces-change-to-TD-Prime-Rate"},
+    {"effective": "2025-09-18", "rate": 4.70, "bank": "TD", "url": "https://td.mediaroom.com/2025-09-17-TD-Canada-Trust-announces-change-to-TD-Prime-Rate"},
+    {"effective": "2025-10-30", "rate": 4.45, "bank": "TD", "url": "https://stories.td.com/ca/en/news/2025-10-29-td-canada-trust-announces-change-to-td-prime-rate"}
+  ]
+}

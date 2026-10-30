@@ -11,7 +11,10 @@ Sources (all free, no API key):
              publishes day D on day D+1. Note that a rate decision takes
              effect the day after the announcement.
   ca/prime   Chartered bank prime rate. BoC Valet V80691311 (weekly, as at
-             Wednesday) plus RBC's posted prime from RBC's public rates API,
+             Wednesday), so a change shows up to 6 days late there. Changes
+             with an exact effective date from a bank's own press release
+             (data/ca_prime_bank_releases.json, cited per change) override
+             it. Plus RBC's posted prime from RBC's public rates API,
              which carries its own effective date and updates the same day a
              bank changes prime. The RBC point is best effort.
   us/policy  Effective federal funds rate, FRED DFF (daily).
@@ -114,6 +117,13 @@ def fetch_fred(series_id: str) -> pd.DataFrame:
     return _frame(df[[df.columns[0], series_id]].values.tolist())
 
 
+def load_bank_releases() -> pd.DataFrame:
+    """Prime changes at their exact effective dates, from banks' own press
+    releases (data/ca_prime_bank_releases.json, one cited URL per change)."""
+    changes = json.loads((DATA_DIR / "ca_prime_bank_releases.json").read_text())["changes"]
+    return _frame([(c["effective"], c["rate"]) for c in changes])
+
+
 def fetch_rbc_prime() -> pd.DataFrame:
     """RBC's posted prime as a single observation dated at its effective date."""
     rates = _get(RBC_RATES_URL, lang="en").json()
@@ -170,6 +180,7 @@ SERIES: Dict[Tuple[str, str], Series] = {(s.region, s.key): s for s in [
     )),
     Series("ca", "prime", "Canadian Prime Rate", (
         Part(partial(fetch_valet, "V80691311"), "BoC Valet V80691311"),
+        Part(load_bank_releases, "bank press releases"),
         Part(fetch_rbc_prime, "RBC posted prime", required=False),
     ), max_age_days=10),
     Series("us", "policy", "Fed Funds Rate", (

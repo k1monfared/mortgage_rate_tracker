@@ -92,6 +92,17 @@ def test_rbc_prime_parses_effective_date(monkeypatch):
         rates.fetch_rbc_prime()
 
 
+def test_prime_bank_releases_match_policy_effective_dates():
+    # Each cited prime change takes effect on the same day as a policy change
+    # in the same direction, which is what the banks' releases state.
+    policy = emails.trigger_changes("ca", limit=50)
+    moves = {c["date"]: c["value"] - p["value"] for c, p in zip(policy, policy[1:])}
+    for _, row in rates.load_bank_releases().iterrows():
+        assert row["date"].strftime("%Y-%m-%d") in moves
+        assert emails.prime_on_date(rates.get("ca", "prime").csv,
+                                    row["date"].strftime("%Y-%m-%d")) == row["rate"]
+
+
 def test_trigger_detects_only_new_changes(tmp_path):
     csv = tmp_path / "t.csv"
     csv.write_text("date,rate\n2025-10-29,2.5\n2025-10-30,2.25\n2026-10-28,2.25\n2026-10-29,2.5\n")
