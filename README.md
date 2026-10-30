@@ -11,7 +11,7 @@ Tracks central bank policy rates and prime rates for Canada and the US, and emai
 Each region page shows:
 
 - The current policy rate and prime rate, each with its as-of date
-- An interactive step chart of the full history. Hover to read values, zoom and pan freely.
+- An interactive step chart of the full history. Hover to read values for any day, click to keep that day's tooltip open (click again to close), zoom and pan freely.
 
 ## Local Setup
 
@@ -55,7 +55,7 @@ How a refresh works: each run downloads every series in full and merges it into 
 
 Announced changes: Valet publishes a new policy rate a day or more after the Bank announces it. Each run therefore also reads the Bank's press release feed. Every rate decision in it is stored in `data/ca_announcements.json` (title, summary, link, announcement date, new rate). The rate is read from the release title with a regular expression and must agree with the decimal rate in the summary. A title that cannot be read is skipped with a warning. The new rate takes effect on the next business day, and the announcement gets one of three statuses:
 
-- `pending`: Valet has no observation on or after the effective date yet. The announced rate is used as the newest point of the policy series everywhere: the chart (drawn in a different color, with "(announced)" and a link to the press release in the tooltip, which a click pins open so the link can be clicked), the stat box ("announced ..., effective ..."), and the email trigger. The email links to the announcement.
+- `pending`: Valet has no observation on or after the effective date yet. The announced rate is used as the newest point of the policy series everywhere: the chart (drawn in a different color, with "(announced)" and a link to the press release in the tooltip), the stat box ("announced ..., effective ..."), and the email trigger. The email links to the announcement.
 - `confirmed`: Valet has published the effective date. Valet's value is used and the chart color goes back to normal. If Valet disagrees with the announced rate, a warning is printed and Valet wins. Since the email already went out for the same date and rate, nothing new is sent.
 - `held`: the decision left the rate unchanged.
 

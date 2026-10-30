@@ -489,16 +489,13 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     });
     // Link each announced change to the central bank's release. The tooltip
     // follows the mouse, so a click pins it (see init) to make it reachable.
-    var links = SERIES_DEFS.filter(function(def) { return pendingOn(def.key, ts); });
-    links.forEach(function(def) {
+    SERIES_DEFS.filter(function(def) { return pendingOn(def.key, ts); }).forEach(function(def) {
       var a = rates.pending[def.key];
       html += '<a href="' + escapeHtml(a.url) + '" target="_blank" rel="external noopener" '
            + 'style="color:' + pal.link + '">' + escapeHtml(a.title) + '</a><br>';
     });
-    if (links.length) {
-      html += '<span style="font-size:11px;color:' + pal.muted + '">'
-           + (tooltipPinned ? 'Click the chart to close' : 'Click to keep this open') + '</span>';
-    }
+    html += '<span style="font-size:11px;color:' + pal.muted + '">'
+         + (tooltipPinned ? 'Click the chart to close' : 'Click to keep this open') + '</span>';
     return html;
   }
 
@@ -508,7 +505,7 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     });
   }
 
-  // True while a click has pinned a tooltip that contains an announcement link.
+  // True while a click has pinned the tooltip in place.
   var tooltipPinned = false;
 
   // ── Chart update helpers ───────────────────────────────────────────────
@@ -706,22 +703,19 @@ REGION_TEMPLATE = r"""<!DOCTYPE html>
     });
     chart.getZr().on('globalout', function() { if (!tooltipPinned) hoverMs = null; });
 
-    // Clicking a day with an announced change pins its tooltip so the
-    // announcement link can be clicked. The next click on the chart unpins.
+    // A click pins the tooltip for that day, so it stays put for comparing
+    // values or clicking an announcement link. The next click unpins.
     function setTooltipPinned(pinned, e) {
       tooltipPinned = pinned;
       chart.setOption({ tooltip: { triggerOn: pinned ? 'none' : 'mousemove|click' } });
       chart.dispatchAction({ type: 'showTip', x: e.offsetX, y: e.offsetY });
     }
     chart.getZr().on('click', function(e) {
+      // Ignore clicks on the legend and the zoom slider.
+      if (!chart.containPixel({ gridIndex: 0 }, [e.offsetX, e.offsetY])) return;
       var x = chart.convertFromPixel({ xAxisIndex: 0 }, e.offsetX);
       hoverMs = x;
-      if (tooltipPinned) {
-        setTooltipPinned(false, e);
-        return;
-      }
-      var hasLink = SERIES_DEFS.some(function(def) { return pendingOn(def.key, hoveredDay(x)); });
-      if (hasLink) setTooltipPinned(true, e);
+      setTooltipPinned(!tooltipPinned, e);
     });
 
     // Events toggle — markArea lives on the first series only (one band per
