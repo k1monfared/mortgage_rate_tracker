@@ -29,10 +29,13 @@ the announcement the same morning, so every run reads it, parses the new rate
 from the release title (cross-checked against the summary) and stores each
 rate announcement in data/ca_announcements.json. The new rate takes effect on
 the next business day. Until Valet has an observation on or after that day
-the announcement is "pending": load_with_pending() adds it to the series as
-its newest point, so the chart, the stat boxes and the email trigger all use
-it. Once Valet covers the effective date the announcement becomes
-"confirmed" and Valet's own value is used. Announcements that leave the rate
+showing the announced rate, the announcement is "pending": load_with_pending()
+adds it to the series as its newest point, so the chart, the stat boxes and
+the email trigger all use it. Valet has published the effective date at the
+old rate first and corrected it later (2026-10-29), so a disagreeing value
+keeps the announcement pending, with a warning. Once Valet shows the
+announced rate on the effective date the announcement becomes "confirmed" and
+Valet's own value is used. Announcements that leave the rate
 unchanged are stored as "held". A title that cannot be parsed is skipped with
 a warning, which leaves the pipeline exactly as it was without the feed.
 
@@ -389,11 +392,15 @@ def classify(item: Dict, policy: pd.DataFrame) -> Dict:
     if previous == item["rate"]:
         status = "held"
     elif policy["date"].max() >= effective:
-        status = "confirmed"
+        # Valet can first publish the effective date at the old rate and correct
+        # it hours later. Confirm only once Valet agrees with the announcement.
         published = _rate_on(policy, policy[policy["date"] >= effective]["date"].min())
-        if published != item["rate"]:
+        if published == item["rate"]:
+            status = "confirmed"
+        else:
+            status = "pending"
             _warn(f"BoC announced {item['rate']}% effective {effective:%Y-%m-%d} but "
-                  f"Valet shows {published}%. Valet is used.")
+                  f"Valet shows {published}%. Keeping the announced rate until Valet agrees.")
     else:
         status = "pending"
     return {**item, "effective": effective.strftime("%Y-%m-%d"),

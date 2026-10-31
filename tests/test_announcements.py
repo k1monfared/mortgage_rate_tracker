@@ -72,6 +72,21 @@ def test_announcement_is_pending_until_valet_covers_the_effective_date(data):
     assert a["status"] == "confirmed" and rates.pending(series) is None
 
 
+def test_stale_valet_value_does_not_confirm_the_announcement(data):
+    """Valet first published 2026-10-29 at the old 2.25 and corrected it to
+    2.5 later. Until it agrees, the announced rate stays the newest point."""
+    series, policy = data
+    stale = rates.merge(policy, rates._frame([("2026-10-29", 2.25)]))
+    rates.save(series, stale)
+    [a] = rates.refresh_announcements(stale)
+    assert a["status"] == "pending"
+    assert rates.load_with_pending(series)["rate"].tolist()[-1] == 2.5
+
+    corrected = rates.merge(policy, rates._frame([("2026-10-29", 2.5)]))
+    [a] = rates.refresh_announcements(corrected)
+    assert a["status"] == "confirmed"
+
+
 def test_hold_is_not_pending(data, monkeypatch):
     _, policy = data
     monkeypatch.setattr(rates, "parse_announced_rate", lambda *a: 2.25)
